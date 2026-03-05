@@ -1,0 +1,10 @@
+streamlit==1.33.0
+aiohttp==3.9.5
+beautifulsoup4==4.12.3
+tldextract==5.1.2
+yarl==1.9.4
+pandas==2.2.3
+numpy==1.26.4
+setuptools>=68
+wheel>=0.41
+packaging>=24
