@@ -1,58 +1,47 @@
+import asyncio
 from urllib.parse import urlparse, urljoin
 from urllib import robotparser
 import aiohttp
 from xml.etree import ElementTree
 
 async def fetch_text(session: aiohttp.ClientSession, url: str, timeout: int = 15) -> str | None:
-    """Fetch text content from a URL, returning None on errors or non-200 status."""
     try:
-        async with session.get(url, timeout=timeout, allow_redirects=True) as resp:
+        async with session.get(url, timeout=timeout) as resp:
             if resp.status == 200:
-                # errors="ignore" avoids decode crashes on odd encodings
-                return await resp.text(errors="ignore")
+                return await resp.text()
     except Exception:
-        pass
+        return None
     return None
 
-async def load_robots(session: aiohttp.ClientSession, base_url: str, user_agent: str):
+async def load_robots(session: aiohttp.ClientSession, base_url: str, user_agent: str) -> tuple[robotparser.RobotFileParser | None, list[str]]:
     """
-    Load robots.txt (if present) and discover sitemap URLs.
-    Returns: (robotparser or None, list_of_sitemaps)
+    Returns (robotparser or None if not found, sitemap_urls list)
     """
     parts = urlparse(base_url)
     robots_url = f"{parts.scheme}://{parts.netloc}/robots.txt"
-
-    sitemaps: list[str] = []
-    rp: robotparser.RobotFileParser | None = None
-
     txt = await fetch_text(session, robots_url)
+    sitemaps = []
+    rp = None
     if txt:
-        try:
-            rp = robotparser.RobotFileParser()
-            # Parse robots rules from content
-            rp.parse(txt.splitlines())
-        except Exception:
-            rp = None
-
-        # Extract "Sitemap:" entries from robots.txt
+        rp = robotparser.RobotFileParser()
+        rp.parse(txt.splitlines())
+        # Extract sitemaps if present
         for line in txt.splitlines():
             if line.lower().startswith("sitemap:"):
                 sm = line.split(":", 1)[1].strip()
                 if sm:
                     sitemaps.append(sm)
-
-    # Fallback: try /sitemap.xml when none discovered via robots.txt
+    else:
+        rp = None
+    # Also try /sitemap.xml if not present
     if not sitemaps:
         sitemap_url = urljoin(f"{parts.scheme}://{parts.netloc}", "/sitemap.xml")
         text = await fetch_text(session, sitemap_url)
-        # FIX: guard with parentheses and use real '<' tokens
-        if text and ("<urlset" in text or "<sitemapindex" in text):
+        if text and "<urlset" in text or "<sitemapindex" in text:
             sitemaps.append(sitemap_url)
-
     return rp, sitemaps
 
 def can_fetch(rp: robotparser.RobotFileParser | None, user_agent: str, url: str, respect: bool) -> bool:
-    """Check if a URL can be fetched according to robots.txt (if respecting robots)."""
     if not respect or rp is None:
         return True
     try:
@@ -61,25 +50,18 @@ def can_fetch(rp: robotparser.RobotFileParser | None, user_agent: str, url: str,
         return True
 
 def parse_sitemap(xml_text: str) -> list[str]:
-    """
-    Parse a sitemap XML (urlset or sitemapindex) and return discovered URLs.
-    """
-    urls: list[str] = []
+    urls = []
     try:
         root = ElementTree.fromstring(xml_text)
-        # Handle namespaced and non-namespaced XML
         ns = {"s": root.tag[root.tag.find("{")+1:root.tag.find("}")]} if "}" in root.tag else {}
-
-        # urlset -> url -> loc
+        # urlset
         for u in root.findall(".//s:url/s:loc", ns) + root.findall(".//url/loc"):
             if u.text:
                 urls.append(u.text.strip())
-
-        # sitemapindex -> sitemap -> loc (nested sitemaps)
+        # sitemapindex -> nested sitemaps
         for sm in root.findall(".//s:sitemap/s:loc", ns) + root.findall(".//sitemap/loc"):
             if sm.text:
                 urls.append(sm.text.strip())
     except Exception:
         pass
-
     return urls
