@@ -11,10 +11,13 @@ from crawler.report import (
     to_dataframe, to_csv, to_json,
     issues_to_dataframe, issues_to_csv, issues_to_json,
     overall_site_score,
-    # The following exist if you adopted the unique-findings feature.
-    # If not present in your repo, you can comment them out and the related UI section.
-    aggregate_unique_findings, unique_findings_to_csv, unique_findings_to_json
 )
+# Try unique-findings helpers if present
+try:
+    from crawler.report import aggregate_unique_findings, unique_findings_to_csv, unique_findings_to_json
+    HAVE_UNIQUE = True
+except Exception:
+    HAVE_UNIQUE = False
 
 # Optional Playwright-based crawler (JS Mode)
 try:
@@ -60,7 +63,6 @@ def _read_targets_from_file(uploaded_file) -> list[str]:
     try:
         name = (uploaded_file.name or "").lower()
         if name.endswith(".xlsx") or name.endswith(".xls"):
-            # Requires openpyxl in requirements
             df = pd.read_excel(uploaded_file, engine="openpyxl")
         elif name.endswith(".csv"):
             df = pd.read_csv(uploaded_file)
@@ -71,7 +73,6 @@ def _read_targets_from_file(uploaded_file) -> list[str]:
         if df.empty:
             return []
 
-        # Select column by heuristic
         cand = [c for c in df.columns if str(c).strip().lower() in ("url", "urls", "target", "targets")]
         col = cand[0] if cand else df.columns[0]
         series = df[col].dropna()
@@ -88,7 +89,6 @@ def _read_targets_from_file(uploaded_file) -> list[str]:
         st.error(f"Could not read uploaded file: {e}")
         return []
 
-    # De-duplicate while preserving order
     return list(dict.fromkeys(urls))
 
 def _build_severity_chart(df_issues: pd.DataFrame):
@@ -110,9 +110,7 @@ def _build_severity_chart(df_issues: pd.DataFrame):
         "INFO": "#3b82f6",
     }
 
-    # Start with zeros for all severities
     counts_map = {sev: 0 for sev in order}
-
     if df_issues is not None and not df_issues.empty and "severity" in df_issues.columns:
         vc = df_issues["severity"].value_counts()
         for sev, cnt in vc.items():
@@ -145,10 +143,8 @@ def _build_severity_chart(df_issues: pd.DataFrame):
 with st.sidebar:
     st.header("Scan Targets")
 
-    # Single URL (optional)
     start_url = st.text_input("Single URL (optional)", placeholder="https://example.com")
 
-    # Bulk URLs via file
     target_file = st.file_uploader(
         "Bulk URLs file (optional) — .xlsx or .csv",
         type=["xlsx", "xls", "csv"],
@@ -193,11 +189,19 @@ with st.sidebar:
                     extra[k.strip()] = v.strip()
 
     st.header("JavaScript (Playwright) [beta]")
-    enable_js = st.checkbox(
-        "Enable JavaScript rendering (SPA/JS links)",
-        value=False,
-        help="Requires Playwright/Chromium. If unavailable, the app will fall back to the fast HTTP crawler."
-    )
+    # Disable toggle if Playwright isn't importable; runtime may still block Chromium => we also auto-fallback below.
+    if _PLAYWRIGHT_AVAILABLE and BrowserCrawler is not None:
+        enable_js = st.checkbox(
+            "Enable JavaScript rendering (SPA/JS links)",
+            value=False,
+            help="If Chromium isn't available on this host, the app falls back to the HTTP crawler automatically."
+        )
+    else:
+        enable_js = st.checkbox(
+            "Enable JavaScript rendering (SPA/JS links)",
+            value=False, disabled=True,
+            help="Playwright not importable in this environment. Use HTTP mode or deploy with a Playwright container."
+        )
     clicks_per_page = st.slider(
         "Click exploration per page (same-origin only)",
         min_value=0, max_value=3, value=0,
@@ -233,7 +237,6 @@ if reset_button:
 # Run crawl (single or bulk)
 # -------------------------
 if run_button:
-    # Gather targets
     targets: list[str] = []
     if isinstance(start_url, str) and start_url.strip():
         su = start_url.strip()
@@ -247,7 +250,6 @@ if run_button:
         file_urls = _read_targets_from_file(target_file)
         targets.extend(file_urls)
 
-    # De-duplicate final list
     targets = list(dict.fromkeys([t.strip() for t in targets if t.strip()]))
 
     if not targets:
@@ -257,7 +259,6 @@ if run_button:
     st.info(f"Starting crawl for {len(targets)} target(s). This may take a while depending on limits and site sizes.")
     progress = st.progress(0)
 
-    # Auth config (for HTTP crawler). For JS mode we pass parts directly.
     auth_cfg = AuthConfig(
         basic_user=basic_user,
         basic_pass=basic_pass,
@@ -274,18 +275,8 @@ if run_button:
     all_issues: list[pd.DataFrame] = []
 
     for idx, target in enumerate(targets, start=1):
-        # Decide mode
-        if enable_js:
-            if not _PLAYWRIGHT_AVAILABLE or BrowserCrawler is None:
-                st.warning(
-                    "Playwright (Chromium) is not available in this runtime. "
-                    "Falling back to the fast HTTP crawler for this run."
-                )
-                use_js = False
-            else:
-                use_js = True
-        else:
-            use_js = False
+        # Decide mode for this target
+        use_js = bool(enable_js and _PLAYWRIGHT_AVAILABLE and (BrowserCrawler is not None))
 
         if use_js:
             crawler = BrowserCrawler(
@@ -307,7 +298,6 @@ if run_button:
             async def run_and_collect():
                 await crawler.run()
                 return crawler.findings, crawler.issues
-
         else:
             crawler = Crawler(
                 start_url=target,
@@ -326,8 +316,35 @@ if run_button:
                 await crawler.run()
                 return crawler.findings, crawler.issues
 
-        # Run (both modes return findings, issues)
-        findings, issues = asyncio.run(run_and_collect())
+        # ---- Run the selected crawler with auto-fallback for JS mode ----
+        try:
+            findings, issues = asyncio.run(run_and_collect())
+        except Exception:
+            js_failed = True
+        else:
+            js_failed = bool(getattr(crawler, "last_error", None)) if use_js else False
+
+        if use_js and js_failed:
+            warn_msg = getattr(crawler, "last_error", "Playwright failed")
+            st.warning(f"JS mode unavailable in this runtime ({warn_msg}). Falling back to HTTP crawler for {target}.")
+            http_crawler = Crawler(
+                start_url=target,
+                allow_subdomains=allow_subdomains,
+                max_depth=int(max_depth),
+                max_pages=int(max_pages),
+                concurrency=int(concurrency),
+                respect_robots=bool(respect_robots),
+                rate_delay_range=(float(rate_min), float(rate_max)) if rate_max >= rate_min else (float(rate_max), float(rate_min)),
+                user_agent=ua.strip() or DEFAULT_UA,
+                exclude_prefixes=[p.strip() for p in exclude_prefixes if p.strip()],
+                auth=auth_cfg,
+            )
+
+            async def _http_run():
+                await http_crawler.run()
+                return http_crawler.findings, http_crawler.issues
+
+            findings, issues = asyncio.run(_http_run())
 
         # Convert to DataFrames
         df_pages = to_dataframe(findings) if findings else pd.DataFrame()
@@ -355,28 +372,30 @@ if run_button:
 - **Scope blocked**: Ensure **Allow subdomains** is correct. Start from the canonical (post-redirect) host.
 - **Depth/limits**: Increase **Max depth** (e.g., 3→5) and **Max pages** (e.g., 500→2000).
 - **Auth/redirects**: If the start URL redirects to login or a different host, use **Login Form**/**Cookie** auth, or start from a public in-scope page.
-- **SPA/JS navigation**: Enable **JavaScript (Playwright)** mode to discover client-side routes. If unavailable, deploy with Playwright + Chromium.
+- **SPA/JS navigation**: Enable **JavaScript (Playwright)** mode. On managed hosts, deploy a container with Chromium to use JS mode.
 - **Rate/timeouts**: For slow sites, increase **Rate delay** and retry.
 """)
         st.stop()
 
-    # Aggregate overall score (simple mean proxy for display)
+    # Aggregate overall score (simple mean proxy)
     try:
         site_score = int(df_pages_all["security_score"].mean()) if "security_score" in df_pages_all.columns and not df_pages_all.empty else 0
     except Exception:
         site_score = 0
 
-    # Unique (de-duplicated) findings with safety guard (if available in your report.py)
-    try:
-        df_unique = aggregate_unique_findings(df_issues_all, df_pages_all)
-    except Exception:
-        st.warning("Unique-findings aggregation failed on this run. Raw results are still available.")
-        df_unique = pd.DataFrame()
+    # Unique (de-duplicated) findings (optional if helpers exist)
+    df_unique = pd.DataFrame()
+    if HAVE_UNIQUE:
+        try:
+            df_unique = aggregate_unique_findings(df_issues_all, df_pages_all)
+        except Exception:
+            st.warning("Unique-findings aggregation failed on this run. Raw results are still available.")
+            df_unique = pd.DataFrame()
 
     # Persist in session_state
     st.session_state.results_pages_df = df_pages_all
     st.session_state.results_issues_df = df_issues_all
-    st.session_state.results_unique_df = df_unique
+    st.session_state.results_unique_df = df_unique if HAVE_UNIQUE else None
     st.session_state.site_score = site_score
     st.session_state.last_params = {
         "targets": targets,
@@ -389,7 +408,7 @@ if run_button:
         "ua": ua.strip() or DEFAULT_UA,
         "exclude_prefixes": [p.strip() for p in exclude_prefixes if p.strip()],
         "auth_mode": auth_mode,
-        "enable_js": enable_js,
+        "enable_js": bool(enable_js),
         "clicks_per_page": int(clicks_per_page),
     }
 
@@ -426,36 +445,36 @@ if st.session_state.results_pages_df is not None:
     else:
         st.info("No issues detected by header audit.")
 
-    # Unique findings (fix-once view)
-    with st.expander("🧩 Unique findings (de-duplicated, fix-once guidance)", expanded=True):
-        if df_unique is not None and not df_unique.empty:
-            show_cols = ["seed", "host", "severity", "title", "check_id", "affected_pages", "coverage", "scope", "fix_hint_location", "sample_urls"]
-            show_cols = [c for c in show_cols if c in df_unique.columns]
-            view = df_unique.copy()
-            if "coverage" in view.columns:
-                view["coverage"] = view["coverage"].apply(lambda x: f"{x:.0%}" if pd.notnull(x) else "")
-            st.dataframe(view[show_cols], use_container_width=True, hide_index=True)
+    # Unique findings (fix-once view) if available
+    if HAVE_UNIQUE:
+        with st.expander("🧩 Unique findings (de-duplicated, fix-once guidance)", expanded=True):
+            if df_unique is not None and not df_unique.empty:
+                show_cols = ["seed", "host", "severity", "title", "check_id", "affected_pages", "coverage", "scope", "fix_hint_location", "sample_urls"]
+                show_cols = [c for c in show_cols if c in df_unique.columns]
+                view = df_unique.copy()
+                if "coverage" in view.columns:
+                    view["coverage"] = view["coverage"].apply(lambda x: f"{x:.0%}" if pd.notnull(x) else "")
+                st.dataframe(view[show_cols], use_container_width=True, hide_index=True)
 
-            # Downloads
-            cdl_u1, cdl_u2 = st.columns(2)
-            with cdl_u1:
-                st.download_button(
-                    "⬇️ Unique findings CSV",
-                    data=unique_findings_to_csv(df_unique),
-                    file_name="unique_findings.csv",
-                    mime="text/csv",
-                    key="dl_unique_csv"
-                )
-            with cdl_u2:
-                st.download_button(
-                    "⬇️ Unique findings JSON",
-                    data=unique_findings_to_json(df_unique),
-                    file_name="unique_findings.json",
-                    mime="application/json",
-                    key="dl_unique_json"
-                )
-        else:
-            st.info("No unique findings aggregated (no issues found).")
+                cdl_u1, cdl_u2 = st.columns(2)
+                with cdl_u1:
+                    st.download_button(
+                        "⬇️ Unique findings CSV",
+                        data=unique_findings_to_csv(df_unique),
+                        file_name="unique_findings.csv",
+                        mime="text/csv",
+                        key="dl_unique_csv"
+                    )
+                with cdl_u2:
+                    st.download_button(
+                        "⬇️ Unique findings JSON",
+                        data=unique_findings_to_json(df_unique),
+                        file_name="unique_findings.json",
+                        mime="application/json",
+                        key="dl_unique_json"
+                    )
+            else:
+                st.info("No unique findings aggregated (no issues found).")
 
     # Pages Table (raw)
     with st.expander("📄 Pages (with security score)", expanded=False):
