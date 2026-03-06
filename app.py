@@ -270,6 +270,7 @@ if run_button:
             return crawler.findings, crawler.issues
 
         findings, issues = asyncio.run(run_and_collect())
+        stats = getattr(crawler, "stats", {})  # <-- NEW: capture per-target stats
 
         # Convert to DataFrames
         df_pages = to_dataframe(findings) if findings else pd.DataFrame()
@@ -283,6 +284,15 @@ if run_button:
             df_issues.insert(0, "seed", target)
             all_issues.append(df_issues)
 
+        # (NEW) If this target produced no pages/issues, show quick debug now
+        if df_pages.empty and df_issues.empty and stats:
+            with st.expander(f"ℹ️ Debug for {target}", expanded=False):
+                st.json(stats)
+                st.write(
+                    "Tips: Try unchecking **Respect robots.txt**, verify **Allow subdomains**, "
+                    "increase **Max depth**/**Max pages**, and ensure the start URL loads without login redirects."
+                )
+
         progress.progress(int(idx * 100 / len(targets)))
 
     # Merge across targets
@@ -290,7 +300,16 @@ if run_button:
     df_issues_all = pd.concat(all_issues, ignore_index=True) if all_issues else pd.DataFrame()
 
     if df_pages_all.empty and df_issues_all.empty:
-        st.warning("No pages crawled or no issues found across the provided targets. Check scope/limits/auth and try again.")
+        st.warning("No pages crawled or no issues found across the provided targets.")
+        # Consolidated debug tips
+        with st.expander("Debug tips", expanded=True):
+            st.markdown("""
+- **Robots blocked**: Uncheck **Respect robots.txt** in the sidebar and retry.
+- **Scope blocked**: Ensure **Allow subdomains** is correct. For IP/localhost, the seed host is auto-allowed.
+- **Depth/limits**: Increase **Max depth** (e.g., 3→5) and **Max pages** (e.g., 500→2000).
+- **Auth/redirects**: If the start URL redirects to login or a different host, use **Login Form**/**Cookie** auth, or start from a public in-scope page.
+- **Rate/timeouts**: For slow sites, increase **Rate delay** and retry.
+""")
         st.stop()
 
     # Aggregate overall score (simple mean proxy for display)
@@ -475,3 +494,4 @@ else:
         st.session_state.message = None
     else:
         st.info("Add a Single URL and/or upload a Bulk URLs file, configure scope/auth, then click **Start Crawl**.")
+``
