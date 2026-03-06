@@ -17,7 +17,7 @@ from crawler.report import (
 # Page config
 # -------------------------
 st.set_page_config(page_title="Authorized Crawler", page_icon="🕷️", layout="wide")
-st.title("🕷️ Authorized Web Crawler")
+st.title("🕷️ Scrawler-V")
 st.caption("For in-scope, authorized discovery only. Passive header analysis — no bypassing protections.")
 
 # -------------------------
