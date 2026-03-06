@@ -1,6 +1,8 @@
 import asyncio
 import streamlit as st
 import pandas as pd
+import altair as alt
+from urllib.parse import urlparse
 
 from crawler.crawl import Crawler, DEFAULT_UA
 from crawler.auth import AuthConfig
@@ -20,27 +22,120 @@ st.caption("For in-scope, authorized discovery only. Passive header analysis —
 # -------------------------
 # Session state init
 # -------------------------
-if "results_pages_df" not in st.session_state:
-    st.session_state.results_pages_df = None
-if "results_issues_df" not in st.session_state:
-    st.session_state.results_issues_df = None
-if "site_score" not in st.session_state:
-    st.session_state.site_score = None
-if "last_params" not in st.session_state:
-    st.session_state.last_params = {}
-if "message" not in st.session_state:
-    st.session_state.message = None
+for key, default in [
+    ("results_pages_df", None),
+    ("results_issues_df", None),
+    ("site_score", None),
+    ("last_params", {}),
+    ("message", None),
+]:
+    if key not in st.session_state:
+        st.session_state[key] = default
+
+# -------------------------
+# Helpers
+# -------------------------
+def _read_targets_from_file(uploaded_file) -> list[str]:
+    """
+    Read URLs from uploaded .xlsx or .csv.
+    Heuristics:
+      - looks for columns: url/urls/target/targets (case-insensitive), else first column
+      - keeps only http/https with netloc
+      - de-duplicates while preserving order
+    Returns a list of validated URLs.
+    """
+    urls: list[str] = []
+    try:
+        name = (uploaded_file.name or "").lower()
+        if name.endswith(".xlsx") or name.endswith(".xls"):
+            df = pd.read_excel(uploaded_file, engine="openpyxl")
+        elif name.endswith(".csv"):
+            df = pd.read_csv(uploaded_file)
+        else:
+            st.warning("Unsupported file type. Upload a .xlsx or .csv file.")
+            return []
+
+        if df.empty:
+            return []
+
+        # Select column
+        cand = [c for c in df.columns if str(c).strip().lower() in ("url", "urls", "target", "targets")]
+        col = cand[0] if cand else df.columns[0]
+        series = df[col].dropna()
+
+        for val in series.tolist():
+            u = str(val).strip()
+            if not u:
+                continue
+            p = urlparse(u)
+            if p.scheme in ("http", "https") and p.netloc:
+                urls.append(u)
+
+    except Exception as e:
+        st.error(f"Could not read uploaded file: {e}")
+        return []
+
+    # De-duplicate while preserving order
+    return list(dict.fromkeys(urls))
+
+def _build_severity_chart(df_issues: pd.DataFrame):
+    """
+    Altair bar chart with fixed severity colors:
+      CRITICAL - #7f1d1d (dark red)
+      HIGH     - #dc2626 (red)
+      MEDIUM   - #f97316 (orange)
+      LOW      - #eab308 (yellow)
+      INFO     - #3b82f6 (blue)
+    """
+    order = ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"]
+    palette = ["#7f1d1d", "#dc2626", "#f97316", "#eab308", "#3b82f6"]
+
+    counts = (
+        df_issues["severity"].value_counts()
+        .reindex(order, fill_value=0)
+        .reset_index()
+        .rename(columns={"index": "severity", "severity": "count"})
+    )
+
+    chart = (
+        alt.Chart(counts)
+        .mark_bar()
+        .encode(
+            x=alt.X("severity:N", sort=order, title="Severity"),
+            y=alt.Y("count:Q", title="Findings"),
+            color=alt.Color(
+                "severity:N",
+                sort=order,
+                scale=alt.Scale(domain=order, range=palette),
+                legend=None,
+            ),
+            tooltip=[alt.Tooltip("severity:N"), alt.Tooltip("count:Q")]
+        )
+        .properties(height=260)
+    )
+    return chart
 
 # -------------------------
 # Sidebar controls
 # -------------------------
 with st.sidebar:
-    st.header("Scope & Limits")
+    st.header("Scan Targets")
 
-    start_url = st.text_input("Start URL", placeholder="https://example.com")
+    # Single URL (kept as-is)
+    start_url = st.text_input("Single URL (optional)", placeholder="https://example.com")
+
+    # Bulk URLs via file
+    target_file = st.file_uploader(
+        "Bulk URLs file (optional) — .xlsx or .csv",
+        type=["xlsx", "xls", "csv"],
+        accept_multiple_files=False,
+        help="File should contain a column named 'url' (or the first column will be used)."
+    )
+
+    st.header("Scope & Limits")
     allow_subdomains = st.checkbox("Allow subdomains", True)
     max_depth = st.number_input("Max depth", min_value=0, max_value=10, value=3)
-    max_pages = st.number_input("Max pages", min_value=1, max_value=5000, value=500)
+    max_pages = st.number_input("Max pages (per target)", min_value=1, max_value=5000, value=500)
     concurrency = st.slider("Concurrency", min_value=1, max_value=32, value=8)
     respect_robots = st.checkbox("Respect robots.txt", value=True)
     rate_min = st.number_input("Rate delay min (sec)", min_value=0.0, max_value=3.0, value=0.1, step=0.1)
@@ -98,16 +193,34 @@ if reset_button:
     st.experimental_rerun()
 
 # -------------------------
-# Run crawl (on demand)
+# Run crawl (single or bulk)
 # -------------------------
 if run_button:
-    if not start_url:
-        st.error("Please provide a Start URL.")
+    # Gather targets
+    targets: list[str] = []
+    if isinstance(start_url, str) and start_url.strip():
+        su = start_url.strip()
+        p = urlparse(su)
+        if p.scheme in ("http", "https") and p.netloc:
+            targets.append(su)
+        else:
+            st.warning("Single URL ignored because it is not a valid http/https URL.")
+
+    if target_file is not None:
+        file_urls = _read_targets_from_file(target_file)
+        targets.extend(file_urls)
+
+    # De-duplicate final list
+    targets = list(dict.fromkeys([t.strip() for t in targets if t.strip()]))
+
+    if not targets:
+        st.error("Provide at least one target: Single URL and/or a bulk file (.xlsx/.csv).")
         st.stop()
 
-    # Keep a message visible during run; since Streamlit reruns, we show a static info
-    st.info("Crawling… This may take a while depending on limits and target size.")
+    st.info(f"Starting crawl for {len(targets)} target(s). This may take a while depending on limits and site sizes.")
+    progress = st.progress(0)
 
+    # Auth config (same for all targets)
     auth = AuthConfig(
         basic_user=basic_user,
         basic_pass=basic_pass,
@@ -120,39 +233,72 @@ if run_button:
         extra_fields=extra,
     )
 
-    crawler = Crawler(
-        start_url=start_url.strip(),
-        allow_subdomains=allow_subdomains,
-        max_depth=int(max_depth),
-        max_pages=int(max_pages),
-        concurrency=int(concurrency),
-        respect_robots=bool(respect_robots),
-        rate_delay_range=(float(rate_min), float(rate_max)) if rate_max >= rate_min else (float(rate_max), float(rate_min)),
-        user_agent=ua.strip() or DEFAULT_UA,
-        exclude_prefixes=[p.strip() for p in exclude_prefixes if p.strip()],
-        auth=auth,
-    )
+    all_pages: list[pd.DataFrame] = []
+    all_issues: list[pd.DataFrame] = []
 
-    async def run_and_collect():
-        await crawler.run()
-        return crawler.findings, crawler.issues
+    for idx, target in enumerate(targets, start=1):
+        # Build crawler per target
+        crawler = Crawler(
+            start_url=target,
+            allow_subdomains=allow_subdomains,
+            max_depth=int(max_depth),
+            max_pages=int(max_pages),
+            concurrency=int(concurrency),
+            respect_robots=bool(respect_robots),
+            rate_delay_range=(float(rate_min), float(rate_max)) if rate_max >= rate_min else (float(rate_max), float(rate_min)),
+            user_agent=ua.strip() or DEFAULT_UA,
+            exclude_prefixes=[p.strip() for p in exclude_prefixes if p.strip()],
+            auth=auth,
+        )
 
-    findings, issues = asyncio.run(run_and_collect())
+        async def run_and_collect():
+            await crawler.run()
+            return crawler.findings, crawler.issues
 
-    if not findings:
-        st.warning("No pages crawled. Check scope/limits/auth or try again.")
+        findings, issues = asyncio.run(run_and_collect())
+
+        # Convert to DataFrames
+        df_pages = to_dataframe(findings) if findings else pd.DataFrame()
+        df_issues = issues_to_dataframe(issues) if issues else pd.DataFrame()
+
+        # Tag with seed to keep provenance when merged
+        if not df_pages.empty:
+            df_pages.insert(0, "seed", target)
+            all_pages.append(df_pages)
+        if not df_issues.empty:
+            df_issues.insert(0, "seed", target)
+            all_issues.append(df_issues)
+
+        progress.progress(int(idx * 100 / len(targets)))
+
+    # Merge across targets
+    df_pages_all = pd.concat(all_pages, ignore_index=True) if all_pages else pd.DataFrame()
+    df_issues_all = pd.concat(all_issues, ignore_index=True) if all_issues else pd.DataFrame()
+
+    if df_pages_all.empty and df_issues_all.empty:
+        st.warning("No pages crawled or no issues found across the provided targets. Check scope/limits/auth and try again.")
         st.stop()
 
-    # Build DataFrames once and persist in session_state
-    df_pages = to_dataframe(findings)
-    df_issues = issues_to_dataframe(issues)
-    site_score = overall_site_score(findings)
+    # Site score: derive a single aggregate from all pages (like before)
+    site_score = overall_site_score([] if df_pages_all.empty else [
+        # Create a light adapter to reuse the scoring function; we only need security_score values.
+        # We'll compute as the mean of existing page scores if the dataclass isn't available here.
+        # However overall_site_score expects a list of PageFinding dataclasses.
+        # To avoid breaking, approximate: use average of security_score.
+    ])
 
-    st.session_state.results_pages_df = df_pages
-    st.session_state.results_issues_df = df_issues
+    # Since overall_site_score operates on dataclasses, compute a proxy aggregate here
+    try:
+        site_score = int(df_pages_all["security_score"].mean()) if "security_score" in df_pages_all.columns and not df_pages_all.empty else 0
+    except Exception:
+        site_score = 0
+
+    # Persist in session_state
+    st.session_state.results_pages_df = df_pages_all
+    st.session_state.results_issues_df = df_issues_all
     st.session_state.site_score = site_score
     st.session_state.last_params = {
-        "start_url": start_url,
+        "targets": targets,
         "allow_subdomains": allow_subdomains,
         "max_depth": int(max_depth),
         "max_pages": int(max_pages),
@@ -172,54 +318,63 @@ if st.session_state.results_pages_df is not None:
     df_issues = st.session_state.results_issues_df
     site_score = int(st.session_state.site_score or 0)
 
+    total_pages = len(df_pages) if df_pages is not None else 0
     st.success(
-        f"Crawl finished. Pages visited: {len(df_pages)}  |  Overall Site Score: {site_score}/100"
+        f"Crawl finished. Total pages visited: {total_pages}  |  Overall Security Score (avg): {site_score}/100"
     )
 
     # KPIs
     c1, c2, c3, c4 = st.columns(4)
     with c1:
-        st.metric("Avg Page Score", int(df_pages["security_score"].mean()))
+        st.metric("Avg Page Score", int(df_pages["security_score"].mean()) if ("security_score" in df_pages.columns and not df_pages.empty) else 0)
     with c2:
-        st.metric("Pages missing CSP", int((~df_pages["hdr_csp"]).sum()))
+        st.metric("Pages missing CSP", int((~df_pages["hdr_csp"]).sum()) if ("hdr_csp" in df_pages.columns) else 0)
     with c3:
-        st.metric("Password forms over HTTP", int(df_pages["password_form_over_http"].sum()))
+        st.metric("Password forms over HTTP", int(df_pages["password_form_over_http"].sum()) if ("password_form_over_http" in df_pages.columns) else 0)
     with c4:
-        st.metric("HTTP errors (>=400)", int((df_pages['status'] >= 400).sum()))
+        st.metric("HTTP errors (>=400)", int((df_pages['status'] >= 400).sum()) if ("status" in df_pages.columns) else 0)
 
-    # Severity Breakdown
+    # Severity Breakdown (Altair with custom colors)
     st.subheader("Severity Breakdown")
-    if df_issues is not None and not df_issues.empty:
-        sev_counts = df_issues["severity"].value_counts().reindex(
-            ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"], fill_value=0
-        )
-        st.bar_chart(sev_counts)
+    if df_issues is not None and not df_issues.empty and "severity" in df_issues.columns:
+        chart = _build_severity_chart(df_issues)
+        st.altair_chart(chart, use_container_width=True)
     else:
         st.info("No issues detected by header audit.")
 
     # Pages Table
     with st.expander("📄 Pages (with security score)", expanded=True):
-        cols = [
+        # Include 'seed' column if present
+        base_cols = [
+            "seed" if "seed" in df_pages.columns else None,
             "final_url","status","title","content_type",
             "security_score",
             "hdr_csp","hdr_xfo","hdr_hsts","hdr_xcto","hdr_refpol",
             "has_password_form","password_form_over_http",
             "num_outlinks_internal","num_outlinks_external"
         ]
-        view = df_pages[cols].sort_values(by="security_score")
-        st.dataframe(view, use_container_width=True, hide_index=True)
+        cols = [c for c in base_cols if c is not None and c in df_pages.columns]
+        if cols:
+            view = df_pages[cols].sort_values(by=["seed","security_score"] if "seed" in cols else "security_score")
+            st.dataframe(view, use_container_width=True, hide_index=True)
+        else:
+            st.info("No page columns available to display.")
 
     # Issues Table
     with st.expander("🛡️ Issues (OWASP-aligned)", expanded=True):
         if df_issues is not None and not df_issues.empty:
+            default_sev = ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"]
             sev_filter = st.multiselect(
                 "Filter by severity",
-                options=["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"],
-                default=["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"]
+                options=default_sev,
+                default=default_sev
             )
-            view_issues = df_issues[df_issues["severity"].isin(sev_filter)].copy()
+            view_issues = df_issues[df_issues["severity"].isin(sev_filter)].copy() if "severity" in df_issues.columns else df_issues.copy()
+            show_cols = ["seed"] if "seed" in view_issues.columns else []
+            show_cols += ["severity","title","url","check_id","description","recommendation"]
+            show_cols = [c for c in show_cols if c in view_issues.columns]
             st.dataframe(
-                view_issues[["severity","title","url","check_id","description","recommendation"]],
+                view_issues[show_cols],
                 use_container_width=True, hide_index=True
             )
         else:
@@ -273,4 +428,4 @@ else:
         st.info(st.session_state.message)
         st.session_state.message = None
     else:
-        st.info("Configure scope/auth in the sidebar and click **Start Crawl**.")
+        st.info("Add a Single URL and/or upload a Bulk URLs file, configure scope/auth, then click **Start Crawl**.")
