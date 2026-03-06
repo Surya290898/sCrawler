@@ -9,8 +9,7 @@ from crawler.auth import AuthConfig
 from crawler.report import (
     to_dataframe, to_csv, to_json,
     issues_to_dataframe, issues_to_csv, issues_to_json,
-    overall_site_score,
-    aggregate_unique_findings, unique_findings_to_csv, unique_findings_to_json
+    overall_site_score
 )
 
 # -------------------------
@@ -26,7 +25,6 @@ st.caption("For in-scope, authorized discovery only. Passive header analysis —
 for key, default in [
     ("results_pages_df", None),
     ("results_issues_df", None),
-    ("results_unique_df", None),
     ("site_score", None),
     ("last_params", {}),
     ("message", None),
@@ -60,7 +58,7 @@ def _read_targets_from_file(uploaded_file) -> list[str]:
         if df.empty:
             return []
 
-        # Select column by heuristic
+        # Select column
         cand = [c for c in df.columns if str(c).strip().lower() in ("url", "urls", "target", "targets")]
         col = cand[0] if cand else df.columns[0]
         series = df[col].dropna()
@@ -134,7 +132,7 @@ def _build_severity_chart(df_issues: pd.DataFrame):
 with st.sidebar:
     st.header("Scan Targets")
 
-    # Single URL (optional)
+    # Single URL (kept as-is)
     start_url = st.text_input("Single URL (optional)", placeholder="https://example.com")
 
     # Bulk URLs via file
@@ -200,7 +198,6 @@ with st.sidebar:
 if reset_button:
     st.session_state.results_pages_df = None
     st.session_state.results_issues_df = None
-    st.session_state.results_unique_df = None
     st.session_state.site_score = None
     st.session_state.last_params = {}
     st.session_state.message = "State cleared. Configure parameters and click Start Crawl."
@@ -270,7 +267,6 @@ if run_button:
             return crawler.findings, crawler.issues
 
         findings, issues = asyncio.run(run_and_collect())
-        stats = getattr(crawler, "stats", {})  # <-- NEW: capture per-target stats
 
         # Convert to DataFrames
         df_pages = to_dataframe(findings) if findings else pd.DataFrame()
@@ -284,15 +280,6 @@ if run_button:
             df_issues.insert(0, "seed", target)
             all_issues.append(df_issues)
 
-        # (NEW) If this target produced no pages/issues, show quick debug now
-        if df_pages.empty and df_issues.empty and stats:
-            with st.expander(f"ℹ️ Debug for {target}", expanded=False):
-                st.json(stats)
-                st.write(
-                    "Tips: Try unchecking **Respect robots.txt**, verify **Allow subdomains**, "
-                    "increase **Max depth**/**Max pages**, and ensure the start URL loads without login redirects."
-                )
-
         progress.progress(int(idx * 100 / len(targets)))
 
     # Merge across targets
@@ -300,35 +287,18 @@ if run_button:
     df_issues_all = pd.concat(all_issues, ignore_index=True) if all_issues else pd.DataFrame()
 
     if df_pages_all.empty and df_issues_all.empty:
-        st.warning("No pages crawled or no issues found across the provided targets.")
-        # Consolidated debug tips
-        with st.expander("Debug tips", expanded=True):
-            st.markdown("""
-- **Robots blocked**: Uncheck **Respect robots.txt** in the sidebar and retry.
-- **Scope blocked**: Ensure **Allow subdomains** is correct. For IP/localhost, the seed host is auto-allowed.
-- **Depth/limits**: Increase **Max depth** (e.g., 3→5) and **Max pages** (e.g., 500→2000).
-- **Auth/redirects**: If the start URL redirects to login or a different host, use **Login Form**/**Cookie** auth, or start from a public in-scope page.
-- **Rate/timeouts**: For slow sites, increase **Rate delay** and retry.
-""")
+        st.warning("No pages crawled or no issues found across the provided targets. Check scope/limits/auth and try again.")
         st.stop()
 
-    # Aggregate overall score (simple mean proxy for display)
+    # Aggregate overall score (simple mean proxy)
     try:
         site_score = int(df_pages_all["security_score"].mean()) if "security_score" in df_pages_all.columns and not df_pages_all.empty else 0
     except Exception:
         site_score = 0
 
-    # Unique (de-duplicated) findings with safety guard
-    try:
-        df_unique = aggregate_unique_findings(df_issues_all, df_pages_all)
-    except Exception:
-        st.warning("Unique-findings aggregation failed on this run. Raw results are still available.")
-        df_unique = pd.DataFrame()
-
     # Persist in session_state
     st.session_state.results_pages_df = df_pages_all
     st.session_state.results_issues_df = df_issues_all
-    st.session_state.results_unique_df = df_unique
     st.session_state.site_score = site_score
     st.session_state.last_params = {
         "targets": targets,
@@ -349,7 +319,6 @@ if run_button:
 if st.session_state.results_pages_df is not None:
     df_pages = st.session_state.results_pages_df
     df_issues = st.session_state.results_issues_df
-    df_unique = st.session_state.results_unique_df
     site_score = int(st.session_state.site_score or 0)
 
     total_pages = len(df_pages) if df_pages is not None else 0
@@ -368,7 +337,7 @@ if st.session_state.results_pages_df is not None:
     with c4:
         st.metric("HTTP errors (>=400)", int((df_pages['status'] >= 400).sum()) if ("status" in df_pages.columns) else 0)
 
-    # Severity Breakdown (colored)
+    # Severity Breakdown (Altair with custom colors; list-of-dicts to avoid Narwhals DuplicateError)
     st.subheader("Severity Breakdown")
     if df_issues is not None and not df_issues.empty and "severity" in df_issues.columns:
         chart = _build_severity_chart(df_issues)
@@ -376,39 +345,9 @@ if st.session_state.results_pages_df is not None:
     else:
         st.info("No issues detected by header audit.")
 
-    # Unique findings (fix-once view)
-    with st.expander("🧩 Unique findings (de-duplicated, fix-once guidance)", expanded=True):
-        if df_unique is not None and not df_unique.empty:
-            show_cols = ["seed", "host", "severity", "title", "check_id", "affected_pages", "coverage", "scope", "fix_hint_location", "sample_urls"]
-            show_cols = [c for c in show_cols if c in df_unique.columns]
-            view = df_unique.copy()
-            if "coverage" in view.columns:
-                view["coverage"] = view["coverage"].apply(lambda x: f"{x:.0%}" if pd.notnull(x) else "")
-            st.dataframe(view[show_cols], use_container_width=True, hide_index=True)
-
-            # Downloads
-            cdl_u1, cdl_u2 = st.columns(2)
-            with cdl_u1:
-                st.download_button(
-                    "⬇️ Unique findings CSV",
-                    data=unique_findings_to_csv(df_unique),
-                    file_name="unique_findings.csv",
-                    mime="text/csv",
-                    key="dl_unique_csv"
-                )
-            with cdl_u2:
-                st.download_button(
-                    "⬇️ Unique findings JSON",
-                    data=unique_findings_to_json(df_unique),
-                    file_name="unique_findings.json",
-                    mime="application/json",
-                    key="dl_unique_json"
-                )
-        else:
-            st.info("No unique findings aggregated (no issues found).")
-
-    # Pages Table (raw)
-    with st.expander("📄 Pages (with security score)", expanded=False):
+    # Pages Table
+    with st.expander("📄 Pages (with security score)", expanded=True):
+        # Include 'seed' column if present
         base_cols = [
             "seed" if "seed" in df_pages.columns else None,
             "final_url","status","title","content_type",
@@ -424,15 +363,14 @@ if st.session_state.results_pages_df is not None:
         else:
             st.info("No page columns available to display.")
 
-    # Issues Table (raw, per page)
-    with st.expander("🛡️ Issues (full evidence, per page)", expanded=False):
+    # Issues Table
+    with st.expander("🛡️ Issues (OWASP-aligned)", expanded=True):
         if df_issues is not None and not df_issues.empty:
             default_sev = ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"]
             sev_filter = st.multiselect(
                 "Filter by severity",
                 options=default_sev,
-                default=default_sev,
-                key="sev_filter_full"
+                default=default_sev
             )
             view_issues = df_issues[df_issues["severity"].isin(sev_filter)].copy() if "severity" in df_issues.columns else df_issues.copy()
             show_cols = ["seed"] if "seed" in view_issues.columns else []
@@ -445,8 +383,8 @@ if st.session_state.results_pages_df is not None:
         else:
             st.info("No issues flagged.")
 
-    # Downloads (raw evidence)
-    st.subheader("Downloads (raw evidence)")
+    # Downloads (use cached DFs so page stays as-is after click)
+    st.subheader("Downloads")
     cdl1, cdl2, cdl3, cdl4 = st.columns(4)
     with cdl1:
         st.download_button(
