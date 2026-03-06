@@ -72,8 +72,9 @@ class Crawler:
         headers = apply_cookie_header(headers, self.auth.cookie_string)
 
         session_kwargs = build_session_kwargs(self.auth)
-        timeout = aiohttp.ClientTimeout(total=30)
-        connector = aiohttp.TCPConnector(ssl=False, limit=0)  # semaphore controls concurrency
+        # Keep per-request deadlines reasonable; total=None means "no global session timeout"
+        timeout = aiohttp.ClientTimeout(total=None, sock_connect=15, sock_read=30)
+        connector = aiohttp.TCPConnector(ssl=False, limit=0)  # semaphore gates concurrency
 
         async with aiohttp.ClientSession(
             headers=headers,
@@ -84,42 +85,65 @@ class Crawler:
             **session_kwargs
         ) as session:
             # Optional authorized login (no bypassing)
-            await perform_form_login(session, self.auth)
+            try:
+                await perform_form_login(session, self.auth)
+            except Exception:
+                # login failures should not kill the crawl
+                pass
 
-            rp, sitemaps = await load_robots(session, self.start_url, self.user_agent)
+            # Robots & sitemap discovery should never abort crawl
+            try:
+                rp, sitemaps = await load_robots(session, self.start_url, self.user_agent)
+            except Exception:
+                rp, sitemaps = (None, [])
 
             # Seed set: start_url + sitemap URLs (limited)
             seeds = set([self.start_url])
             for sm in sitemaps[:5]:
-                xml = await fetch_text(session, sm)
-                if xml:
-                    for u in parse_sitemap(xml):
-                        nu = normalize_url(self.start_url, u)
-                        if nu:
-                            seeds.add(nu)
+                try:
+                    xml = await fetch_text(session, sm)
+                    if xml:
+                        for u in parse_sitemap(xml):
+                            nu = normalize_url(self.start_url, u)
+                            if nu:
+                                seeds.add(nu)
+                except Exception:
+                    continue
 
-            # BFS queue
+            # Initialize queue
             queue: Deque[tuple[str, int]] = deque()
             for s in seeds:
                 if should_enqueue(s, self.start_url, self.scope, self.allow_subdomains, self.exclude_prefixes):
                     queue.append((s, 0))
 
-            while queue and len(self.visited) < self.max_pages:
-                url, depth = queue.popleft()
-                if url in self.visited:
-                    continue
-                self.visited.add(url)
+            # --- Wave scheduler: process queue -> wait tasks -> re-check queue ---
+            while len(self.visited) < self.max_pages:
+                scheduled_any = False
 
-                if not can_fetch(rp, self.user_agent, url, self.respect_robots):
-                    continue
+                # Schedule all currently available URLs (a "wave")
+                while queue and len(self.visited) < self.max_pages:
+                    url, depth = queue.popleft()
+                    if url in self.visited:
+                        continue
+                    self.visited.add(url)
 
-                await self.sem.acquire()
-                asyncio.create_task(self._fetch_and_process(session, url, depth, queue))
+                    # robots guard
+                    if not can_fetch(rp if 'rp' in locals() else None, self.user_agent, url, self.respect_robots):
+                        continue
 
-            await self._drain()
+                    await self.sem.acquire()
+                    asyncio.create_task(self._fetch_and_process(session, url, depth, queue))
+                    scheduled_any = True
+
+                # Wait for this wave to finish
+                await self._drain()
+
+                # Stop if nothing new was scheduled, or no more URLs queued, or we hit cap
+                if not scheduled_any or not queue or len(self.visited) >= self.max_pages:
+                    break
 
     async def _drain(self):
-        # Wait until all scheduled fetch tasks release the semaphore
+        # Wait until all tasks that acquired the semaphore have released it
         while self.sem._value != self.concurrency:  # type: ignore[attr-defined]
             await asyncio.sleep(0.05)
 
@@ -135,7 +159,6 @@ class Crawler:
                 vals = hdrs.getall(k)
                 flat[k] = "\n".join(vals)
         except Exception:
-            # fallback
             for k, v in hdrs.items():
                 flat[k] = v
         return flat
@@ -197,7 +220,7 @@ class Crawler:
                                 if URL(final_url).scheme == "http":
                                     pwd_over_http = True
 
-                        # enqueue next
+                        # enqueue next wave items
                         if depth < self.max_depth:
                             for u in next_urls:
                                 if u not in self.visited and should_enqueue(
@@ -209,50 +232,54 @@ class Crawler:
                         pass
 
                 # --- Security audit on headers (passive) ---
-                flat_headers = self._headers_to_flat(resp.headers)
-                page_score, sec_issues, _summary = analyze_headers(
-                    url=final_url,
-                    status=status,
-                    headers_in=flat_headers,
-                    scheme=scheme,
-                    is_html=is_html,
-                    has_password_form=has_pwd,
-                    page_title=title,  # <-- enables directory-listing indicator & other heuristics
-                )
+                try:
+                    flat_headers = self._headers_to_flat(resp.headers)
+                    page_score, sec_issues, _summary = analyze_headers(
+                        url=final_url,
+                        status=status,
+                        headers_in=flat_headers,
+                        scheme=scheme,
+                        is_html=is_html,
+                        has_password_form=has_pwd,
+                        page_title=title,  # for directory-listing indicator & heuristics
+                    )
 
-                # Store issues
-                for si in sec_issues:
-                    self.issues.append(Issue(
-                        url=si.url,
-                        check_id=si.check_id,
-                        title=si.title,
-                        severity=si.severity,
-                        description=si.description,
-                        recommendation=si.recommendation
+                    # Store issues
+                    for si in sec_issues:
+                        self.issues.append(Issue(
+                            url=si.url,
+                            check_id=si.check_id,
+                            title=si.title,
+                            severity=si.severity,
+                            description=si.description,
+                            recommendation=si.recommendation
+                        ))
+
+                    # Store page finding
+                    self.findings.append(PageFinding(
+                        url=url,
+                        final_url=final_url,
+                        status=status,
+                        reason=reason,
+                        title=title,
+                        content_type=ctype,
+                        content_length=clen,
+                        scheme=scheme,
+                        num_outlinks_internal=out_int,
+                        num_outlinks_external=out_ext,
+                        forms_count=forms,
+                        has_password_form=has_pwd,
+                        password_form_over_http=pwd_over_http,
+                        hdr_csp=hdr_flags["hdr_csp"],
+                        hdr_xfo=hdr_flags["hdr_xfo"],
+                        hdr_hsts=hdr_flags["hdr_hsts"],
+                        hdr_xcto=hdr_flags["hdr_xcto"],
+                        hdr_refpol=hdr_flags["hdr_refpol"],
+                        security_score=page_score
                     ))
-
-                # Store page finding
-                self.findings.append(PageFinding(
-                    url=url,
-                    final_url=final_url,
-                    status=status,
-                    reason=reason,
-                    title=title,
-                    content_type=ctype,
-                    content_length=clen,
-                    scheme=scheme,
-                    num_outlinks_internal=out_int,
-                    num_outlinks_external=out_ext,
-                    forms_count=forms,
-                    has_password_form=has_pwd,
-                    password_form_over_http=pwd_over_http,
-                    hdr_csp=hdr_flags["hdr_csp"],
-                    hdr_xfo=hdr_flags["hdr_xfo"],
-                    hdr_hsts=hdr_flags["hdr_hsts"],
-                    hdr_xcto=hdr_flags["hdr_xcto"],
-                    hdr_refpol=hdr_flags["hdr_refpol"],
-                    security_score=page_score
-                ))
+                except Exception:
+                    # Header audit should never kill fetch
+                    pass
 
         except Exception:
             # Keep crawling even if a single fetch fails
