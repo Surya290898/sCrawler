@@ -9,3 +9,6 @@ openpyxl==3.1.5
 setuptools>=68
 wheel>=0.41
 packaging>=24
+
+# JS mode (Playwright)
+playwright==1.48.0
