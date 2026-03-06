@@ -86,19 +86,30 @@ def _build_severity_chart(df_issues: pd.DataFrame):
       MEDIUM   - #f97316 (orange)
       LOW      - #eab308 (yellow)
       INFO     - #3b82f6 (blue)
+    Uses list-of-dicts data to avoid Narwhals duplicate-column checks.
     """
     order = ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"]
-    palette = ["#7f1d1d", "#dc2626", "#f97316", "#eab308", "#3b82f6"]
+    palette = {
+        "CRITICAL": "#7f1d1d",
+        "HIGH": "#dc2626",
+        "MEDIUM": "#f97316",
+        "LOW": "#eab308",
+        "INFO": "#3b82f6",
+    }
 
-    counts = (
-        df_issues["severity"].value_counts()
-        .reindex(order, fill_value=0)
-        .reset_index()
-        .rename(columns={"index": "severity", "severity": "count"})
-    )
+    # Start with zeros for all severities
+    counts_map = {sev: 0 for sev in order}
+
+    if df_issues is not None and not df_issues.empty and "severity" in df_issues.columns:
+        vc = df_issues["severity"].value_counts()
+        for sev, cnt in vc.items():
+            if sev in counts_map:
+                counts_map[sev] = int(cnt)
+
+    data = [{"severity": sev, "count": counts_map[sev]} for sev in order]
 
     chart = (
-        alt.Chart(counts)
+        alt.Chart(alt.Data(values=data))
         .mark_bar()
         .encode(
             x=alt.X("severity:N", sort=order, title="Severity"),
@@ -106,7 +117,7 @@ def _build_severity_chart(df_issues: pd.DataFrame):
             color=alt.Color(
                 "severity:N",
                 sort=order,
-                scale=alt.Scale(domain=order, range=palette),
+                scale=alt.Scale(domain=order, range=[palette[s] for s in order]),
                 legend=None,
             ),
             tooltip=[alt.Tooltip("severity:N"), alt.Tooltip("count:Q")]
@@ -279,15 +290,7 @@ if run_button:
         st.warning("No pages crawled or no issues found across the provided targets. Check scope/limits/auth and try again.")
         st.stop()
 
-    # Site score: derive a single aggregate from all pages (like before)
-    site_score = overall_site_score([] if df_pages_all.empty else [
-        # Create a light adapter to reuse the scoring function; we only need security_score values.
-        # We'll compute as the mean of existing page scores if the dataclass isn't available here.
-        # However overall_site_score expects a list of PageFinding dataclasses.
-        # To avoid breaking, approximate: use average of security_score.
-    ])
-
-    # Since overall_site_score operates on dataclasses, compute a proxy aggregate here
+    # Aggregate overall score (simple mean proxy)
     try:
         site_score = int(df_pages_all["security_score"].mean()) if "security_score" in df_pages_all.columns and not df_pages_all.empty else 0
     except Exception:
@@ -334,7 +337,7 @@ if st.session_state.results_pages_df is not None:
     with c4:
         st.metric("HTTP errors (>=400)", int((df_pages['status'] >= 400).sum()) if ("status" in df_pages.columns) else 0)
 
-    # Severity Breakdown (Altair with custom colors)
+    # Severity Breakdown (Altair with custom colors; list-of-dicts to avoid Narwhals DuplicateError)
     st.subheader("Severity Breakdown")
     if df_issues is not None and not df_issues.empty and "severity" in df_issues.columns:
         chart = _build_severity_chart(df_issues)
