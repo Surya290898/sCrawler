@@ -1,260 +1,281 @@
-import asyncio
-import random
-from typing import Set, Deque, List, Tuple
-from collections import deque
-import aiohttp
-from bs4 import BeautifulSoup
-from yarl import URL
+from dataclasses import dataclass, asdict
+from typing import List, Dict, Any, Optional
+import pandas as pd
+from urllib.parse import urlparse
+import json
 
-from .utils import normalize_url, should_enqueue, is_within_scope_host
-from .robots import load_robots, can_fetch, parse_sitemap, fetch_text
-from .auth import AuthConfig, apply_cookie_header, perform_form_login, build_session_kwargs
-from .report import PageFinding, Issue
-from .security_audit import analyze_headers
+# -----------------------------
+# Core page finding dataclass
+# -----------------------------
+@dataclass
+class PageFinding:
+    url: str
+    final_url: str
+    status: int
+    reason: str
+    title: str
+    content_type: str
+    content_length: int
+    scheme: str
+    num_outlinks_internal: int
+    num_outlinks_external: int
+    forms_count: int
+    has_password_form: bool
+    password_form_over_http: bool
+    hdr_csp: bool
+    hdr_xfo: bool
+    hdr_hsts: bool
+    hdr_xcto: bool
+    hdr_refpol: bool
+    # extended
+    security_score: int
 
-DEFAULT_UA = "Crawler-For-Authorized-Assessment/1.0 (+https://example.com) StreamlitClient"
+# -----------------------------
+# Issue dataclass
+# -----------------------------
+@dataclass
+class Issue:
+    url: str
+    check_id: str
+    title: str
+    severity: str
+    description: str
+    recommendation: str
 
-SEC_HEADERS = [
-    ("Content-Security-Policy", "hdr_csp"),
-    ("X-Frame-Options", "hdr_xfo"),
-    ("Strict-Transport-Security", "hdr_hsts"),
-    ("X-Content-Type-Options", "hdr_xcto"),
-    ("Referrer-Policy", "hdr_refpol"),
-]
+# -----------------------------
+# Basic converters
+# -----------------------------
+def to_dataframe(findings: List[PageFinding]) -> pd.DataFrame:
+    return pd.DataFrame([asdict(f) for f in findings])
 
-class Crawler:
-    def __init__(
-        self,
-        start_url: str,
-        allow_subdomains: bool = True,
-        max_depth: int = 3,
-        max_pages: int = 500,
-        concurrency: int = 8,
-        respect_robots: bool = True,
-        rate_delay_range: tuple[float, float] = (0.1, 0.5),
-        user_agent: str = DEFAULT_UA,
-        exclude_prefixes: list[str] | None = None,
-        auth: AuthConfig | None = None,
-    ):
-        self.start_url = start_url
-        self.allow_subdomains = allow_subdomains
-        self.max_depth = max_depth
-        self.max_pages = max_pages
-        self.concurrency = concurrency
-        self.respect_robots = respect_robots
-        self.rate_delay_range = rate_delay_range
-        self.user_agent = user_agent
-        self.exclude_prefixes = exclude_prefixes or []
-        self.auth = auth or AuthConfig()
+def to_csv(findings: List[PageFinding]) -> bytes:
+    df = to_dataframe(findings)
+    return df.to_csv(index=False).encode("utf-8")
 
-        self.scope = set()
-        self.scope_token = None
-        self._init_scope()
+def to_json(findings: List[PageFinding]) -> bytes:
+    df = to_dataframe(findings)
+    return df.to_json(orient="records", indent=2).encode("utf-8")
 
-        self.visited: Set[str] = set()
-        self.findings: List[PageFinding] = []
-        self.issues: List[Issue] = []
-        self.sem = asyncio.Semaphore(concurrency)
+def issues_to_dataframe(issues: List[Issue]) -> pd.DataFrame:
+    return pd.DataFrame([asdict(i) for i in issues])
 
-    def _init_scope(self):
-        host = URL(self.start_url).host or ""
-        if not self.allow_subdomains:
-            self.scope = {host}
-        else:
-            from tldextract import extract
-            ext = extract(host)
-            token = f"{ext.domain}.{ext.suffix}" if ext.suffix else ext.domain
-            self.scope = {token}
-            self.scope_token = token
+def issues_to_csv(issues: List[Issue]) -> bytes:
+    df = issues_to_dataframe(issues)
+    return df.to_csv(index=False).encode("utf-8")
 
-    async def run(self):
-        headers = {"User-Agent": self.user_agent, "Accept": "*/*"}
-        headers = apply_cookie_header(headers, self.auth.cookie_string)
+def issues_to_json(issues: List[Issue]) -> bytes:
+    df = issues_to_dataframe(issues)
+    return df.to_json(orient="records", indent=2).encode("utf-8")
 
-        session_kwargs = build_session_kwargs(self.auth)
-        timeout = aiohttp.ClientTimeout(total=30)
-        connector = aiohttp.TCPConnector(ssl=False, limit=0)  # semaphore controls concurrency
+def overall_site_score(findings: List[PageFinding]) -> int:
+    """Weighted average leaning toward worst pages (legacy helper)."""
+    if not findings:
+        return 0
+    scores = [max(0, min(100, f.security_score)) for f in findings]
+    try:
+        return int(sum(scores) / len(scores))
+    except ZeroDivisionError:
+        return 0
 
-        async with aiohttp.ClientSession(
-            headers=headers,
-            timeout=timeout,
-            connector=connector,
-            trust_env=True,
-            raise_for_status=False,
-            **session_kwargs
-        ) as session:
-            # Optional authorized login (no bypassing)
-            await perform_form_login(session, self.auth)
+# -----------------------------
+# Unique Findings Aggregation
+# -----------------------------
 
-            rp, sitemaps = await load_robots(session, self.start_url, self.user_agent)
+# Heuristic “fix location” hints per check family
+_FIX_HINTS = {
+    # CSP/HSTS and core headers → usually global server/app headers
+    "CSP": "Web server / application global response headers (CSP policy)",
+    "HSTS": "Web server / reverse proxy (HTTPS only) — Strict-Transport-Security",
+    "X-Frame-Options": "Web server / application global headers",
+    "X-Content-Type-Options": "Web server / application global headers",
+    "Referrer-Policy": "Web server / application global headers",
+    "Permissions-Policy": "Web server / application global headers",
+    "Feature-Policy": "Web server / application global headers (deprecated — migrate to Permissions-Policy)",
+    "Cross-Origin-Resource-Policy": "Web server / application global headers (CORP)",
+    "Cross-Origin-Embedder-Policy": "Web server / application global headers (COEP)",
+    "Cross-Origin-Opener-Policy": "Web server / application global headers (COOP)",
+    "Expect-CT": "Web server / TLS config (deprecated header)",
+    # CORS
+    "Access-Control-Allow-Origin": "API gateway / origin server CORS configuration",
+    "Access-Control-Allow-Methods": "API gateway / origin server CORS configuration",
+    # Cookies
+    "Set-Cookie": "Application/session middleware where cookies are set",
+    # Cache
+    "Cache-Control": "Application cache policy / reverse proxy",
+    # Info disclosure
+    "Server": "Web server banner / reverse proxy config",
+    "X-Powered-By": "Application platform/framework configuration",
+    "X-AspNet-Version": "Framework configuration",
+    # Other indicators
+    "Directory listing": "Web server directory indexes"
+}
 
-            # Seed set: start_url + sitemap URLs (limited)
-            seeds = set([self.start_url])
-            for sm in sitemaps[:5]:
-                xml = await fetch_text(session, sm)
-                if xml:
-                    for u in parse_sitemap(xml):
-                        nu = normalize_url(self.start_url, u)
-                        if nu:
-                            seeds.add(nu)
+def _header_family_from_issue_title(title: str, check_id: str) -> str:
+    """
+    Try to infer the header/policy family to present a fix-once location.
+    Uses issue title first (parity-style titles), then falls back to check_id.
+    """
+    t = (title or "").lower()
+    cid = (check_id or "").upper()
 
-            # BFS queue
-            queue: Deque[tuple[str, int]] = deque()
-            for s in seeds:
-                if should_enqueue(s, self.start_url, self.scope, self.allow_subdomains, self.exclude_prefixes):
-                    queue.append((s, 0))
+    # Direct name matches from title
+    for key in [
+        "content-security-policy", "strict-transport-security",
+        "x-frame-options", "x-content-type-options", "referrer-policy",
+        "permissions-policy", "feature-policy",
+        "cross-origin-resource-policy", "cross-origin-embedder-policy", "cross-origin-opener-policy",
+        "expect-ct", "access-control-allow-origin", "access-control-allow-methods",
+        "set-cookie", "cache-control", "server", "x-powered-by", "x-aspnet-version",
+        "directory listing"
+    ]:
+        if key in t:
+            return key.title().replace("-", " ")
 
-            while queue and len(self.visited) < self.max_pages:
-                url, depth = queue.popleft()
-                if url in self.visited:
-                    continue
-                self.visited.add(url)
+    # Derive from check_id prefixes
+    if cid.startswith("CSP"):
+        return "Content-Security-Policy"
+    if cid.startswith("HSTS"):
+        return "Strict-Transport-Security"
+    if cid.startswith("CORS") or "ACAO" in cid:
+        return "Access-Control-Allow-Origin"
+    if cid.startswith("COOKIE"):
+        return "Set-Cookie"
+    if cid.startswith("CACHE"):
+        return "Cache-Control"
+    if cid.startswith("TECH_"):
+        return "Server"
+    if cid.startswith("DIR_LISTING"):
+        return "Directory listing"
 
-                if not can_fetch(rp, self.user_agent, url, self.respect_robots):
-                    continue
+    # Default fallback
+    return "Web server / application"
 
-                await self.sem.acquire()
-                asyncio.create_task(self._fetch_and_process(session, url, depth, queue))
-
-            await self._drain()
-
-    async def _drain(self):
-        # Wait until all scheduled fetch tasks release the semaphore
-        while self.sem._value != self.concurrency:  # type: ignore[attr-defined]
-            await asyncio.sleep(0.05)
-
-    def _headers_to_flat(self, hdrs: aiohttp.typedefs.LooseHeaders) -> dict:
-        """
-        Convert response headers to a case-preserving flat dict where repeated headers (e.g., Set-Cookie)
-        are joined with newline separators so we don't lose multiples.
-        """
-        flat: dict = {}
+def _longest_common_path_prefix(urls: List[str]) -> str:
+    """
+    Compute a path-prefix hint across urls: /a/b/ ; returns '/' if no commonality.
+    """
+    paths = []
+    for u in urls:
         try:
-            # hdrs is CIMultiDictProxy
-            for k in hdrs.keys():
-                vals = hdrs.getall(k)
-                flat[k] = "\n".join(vals)
+            p = urlparse(u)
+            # normalize
+            segs = [s for s in (p.path or "/").split("/") if s]
+            paths.append(segs)
         except Exception:
-            # fallback
-            for k, v in hdrs.items():
-                flat[k] = v
-        return flat
-
-    async def _fetch_and_process(self, session: aiohttp.ClientSession, url: str, depth: int, queue):
-        try:
-            await asyncio.sleep(random.uniform(*self.rate_delay_range))
-            async with session.get(url, allow_redirects=True) as resp:
-                final_url = str(resp.url)
-                status = resp.status
-                reason = resp.reason or ""
-                ctype = resp.headers.get("Content-Type", "")
-                clen = int(resp.headers.get("Content-Length", "0") or 0)
-                scheme = URL(final_url).scheme
-
-                text = ""
-                title = ""
-                out_int = 0
-                out_ext = 0
-                forms = 0
-                has_pwd = False
-                pwd_over_http = False
-
-                hdr_flags = {k: False for _, k in SEC_HEADERS}
-                for h, key in SEC_HEADERS:
-                    if resp.headers.get(h):
-                        hdr_flags[key] = True
-
-                is_html = ("text/html" in (ctype or "").lower()) and status < 400
-
-                if is_html:
-                    try:
-                        text = await resp.text(errors="ignore")
-                        # Use built-in parser to avoid lxml dependency on Streamlit Cloud
-                        soup = BeautifulSoup(text, "html.parser")
-
-                        ttag = soup.find("title")
-                        title = (ttag.text.strip() if ttag else "")[:200]
-
-                        # links
-                        links = [a.get("href") for a in soup.find_all("a", href=True)]
-                        next_urls = []
-                        for href in links:
-                            nu = normalize_url(final_url, href)
-                            if not nu:
-                                continue
-                            if is_within_scope_host(nu, self.scope, self.allow_subdomains):
-                                out_int += 1
-                            else:
-                                out_ext += 1
-                            next_urls.append(nu)
-
-                        # forms
-                        for form in soup.find_all("form"):
-                            forms += 1
-                            inputs = form.find_all("input")
-                            if any((i.get("type") or "").lower() == "password" for i in inputs):
-                                has_pwd = True
-                                if URL(final_url).scheme == "http":
-                                    pwd_over_http = True
-
-                        # enqueue next
-                        if depth < self.max_depth:
-                            for u in next_urls:
-                                if u not in self.visited and should_enqueue(
-                                    u, self.start_url, self.scope, self.allow_subdomains, self.exclude_prefixes
-                                ):
-                                    queue.append((u, depth + 1))
-                    except Exception:
-                        # swallow parsing errors to keep crawl running
-                        pass
-
-                # --- Security audit on headers (passive) ---
-                flat_headers = self._headers_to_flat(resp.headers)
-                page_score, sec_issues, _summary = analyze_headers(
-                    url=final_url,
-                    status=status,
-                    headers_in=flat_headers,
-                    scheme=scheme,
-                    is_html=is_html,
-                    has_password_form=has_pwd
-                )
-
-                # Store issues
-                for si in sec_issues:
-                    self.issues.append(Issue(
-                        url=si.url,
-                        check_id=si.check_id,
-                        title=si.title,
-                        severity=si.severity,
-                        description=si.description,
-                        recommendation=si.recommendation
-                    ))
-
-                # Store page finding
-                self.findings.append(PageFinding(
-                    url=url,
-                    final_url=final_url,
-                    status=status,
-                    reason=reason,
-                    title=title,
-                    content_type=ctype,
-                    content_length=clen,
-                    scheme=scheme,
-                    num_outlinks_internal=out_int,
-                    num_outlinks_external=out_ext,
-                    forms_count=forms,
-                    has_password_form=has_pwd,
-                    password_form_over_http=pwd_over_http,
-                    hdr_csp=hdr_flags["hdr_csp"],
-                    hdr_xfo=hdr_flags["hdr_xfo"],
-                    hdr_hsts=hdr_flags["hdr_hsts"],
-                    hdr_xcto=hdr_flags["hdr_xcto"],
-                    hdr_refpol=hdr_flags["hdr_refpol"],
-                    security_score=page_score
-                ))
-
-        except Exception:
-            # Keep crawling even if a single fetch fails
             pass
-        finally:
-            self.sem.release()
+    if not paths:
+        return "/"
+    min_len = min(len(p) for p in paths)
+    prefix = []
+    for i in range(min_len):
+        token = paths[0][i]
+        if all(i < len(p) and p[i] == token for p in paths):
+            prefix.append(token)
+        else:
+            break
+    return "/" + "/".join(prefix) + ("/" if prefix else "")
+
+def aggregate_unique_findings(
+    issues_df: Optional(pd.DataFrame),
+    pages_df: Optional(pd.DataFrame) = None
+) -> pd.DataFrame:
+    """
+    Collapse per-page issues into unique, fix-once items per (seed, host, check_id, title, severity).
+
+    Adds:
+      - host
+      - affected_pages
+      - coverage (affected_pages / total_pages_on_host_for_seed) if pages_df provided
+      - scope (site-wide | path-segment | page-level)
+      - fix_hint_location (where to apply)
+      - sample_urls (up to 3)
+    """
+    if issues_df is None or issues_df.empty:
+        return pd.DataFrame()
+
+    df = issues_df.copy()
+
+    # derive host and seed (if present)
+    def _host_from_url(u: str) -> str:
+        try:
+            return urlparse(u).netloc or ""
+        except Exception:
+            return ""
+
+    if "url" in df.columns:
+        df["host"] = df["url"].apply(_host_from_url)
+    else:
+        df["host"] = ""
+
+    if "seed" not in df.columns:
+        df["seed"] = ""
+
+    # group key
+    group_cols = ["seed", "host", "check_id", "title", "severity"]
+
+    # helper: per-host page totals to compute coverage
+    totals_map: Dict[tuple, int] = {}
+    if pages_df is not None and not pages_df.empty:
+        pp = pages_df.copy()
+        # where do we get host? from final_url
+        if "final_url" in pp.columns:
+            pp["host"] = pp["final_url"].apply(lambda u: urlparse(u).netloc if isinstance(u, str) else "")
+        else:
+            pp["host"] = ""
+        if "seed" not in pp.columns:
+            pp["seed"] = ""
+        totals = pp.groupby(["seed", "host"], dropna=False)["final_url"].nunique().reset_index(name="total_pages")
+        for _, row in totals.iterrows():
+            totals_map[(row.get("seed", ""), row.get("host", ""))] = int(row.get("total_pages", 0))
+
+    rows = []
+    for key, g in df.groupby(group_cols, dropna=False):
+        seed, host, check_id, title, severity = key
+        affected_pages = int(g["url"].nunique()) if "url" in g.columns else len(g)
+        sample_urls = list(g["url"].dropna().unique()[:3]) if "url" in g.columns else []
+        total_pages = totals_map.get((seed, host), 0)
+        coverage = (affected_pages / total_pages) if total_pages > 0 else None
+
+        # scope inference
+        scope = "page-level"
+        if coverage is not None and coverage >= 0.8 and affected_pages >= 5:
+            scope = "site-wide (likely global header/policy)"
+        elif affected_pages >= 3:
+            # derive path prefix
+            prefix = _longest_common_path_prefix(list(g["url"].dropna().unique()))
+            if prefix not in ("/", ""):
+                scope = f"path-segment ({prefix})"
+            else:
+                scope = "multiple pages"
+
+        family = _header_family_from_issue_title(title, check_id)
+        fix_hint_location = _FIX_HINTS.get(family, "Web server / application global configuration")
+
+        rows.append({
+            "seed": seed,
+            "host": host,
+            "check_id": check_id,
+            "title": title,
+            "severity": severity,
+            "affected_pages": affected_pages,
+            "coverage": coverage,
+            "scope": scope,
+            "fix_hint_location": fix_hint_location,
+            "sample_urls": "; ".join(sample_urls)
+        })
+
+    agg = pd.DataFrame(rows)
+
+    # Stable sort: by severity rank then affected_pages desc
+    sev_rank = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
+    if not agg.empty:
+        agg["__sev_rank"] = agg["severity"].map(lambda s: sev_rank.get(s, 9))
+        agg = agg.sort_values(by=["__sev_rank", "affected_pages"], ascending=[True, False]).drop(columns="__sev_rank")
+
+    return agg
+
+def unique_findings_to_csv(df_unique: pd.DataFrame) -> bytes:
+    return df_unique.to_csv(index=False).encode("utf-8")
+
+def unique_findings_to_json(df_unique: pd.DataFrame) -> bytes:
+    return df_unique.to_json(orient="records", indent=2).encode("utf-8")
