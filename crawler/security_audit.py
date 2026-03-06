@@ -30,14 +30,21 @@ def _lc_headers(headers: Dict[str, str]) -> Dict[str, str]:
     return {k.lower(): v for k, v in headers.items() if isinstance(k, str)}
 
 def _getall_set_cookie(headers: Dict[str, str]) -> List[str]:
-    # In crawl.py we will pass merged headers where multiple Set-Cookie are joined with \n
+    """
+    We accept a flattened header mapping where multiple Set-Cookie values
+    are joined with newline separators. Split and return as a list.
+    """
     raw = headers.get("set-cookie", "") or ""
     if not raw:
         return []
     return [line.strip() for line in raw.split("\n") if line.strip()]
 
 def _parse_directives(header_value: str) -> Dict[str, str]:
-    out = {}
+    """
+    Parse semicolon-separated directives like in CSP or HSTS.
+    Returns a dict of directive -> value (value may be empty string).
+    """
+    out: Dict[str, str] = {}
     for part in header_value.split(";"):
         part = part.strip()
         if not part:
@@ -50,7 +57,7 @@ def _parse_directives(header_value: str) -> Dict[str, str]:
     return out
 
 def _parse_hsts(value: str) -> Dict[str, str]:
-    result = {}
+    result: Dict[str, str] = {}
     for token in value.split(";"):
         token = token.strip()
         if "=" in token:
@@ -61,10 +68,14 @@ def _parse_hsts(value: str) -> Dict[str, str]:
     return result
 
 def _parse_cookie_line(line: str) -> Dict[str, str]:
+    """
+    Parse a single Set-Cookie header line into a dict of attributes.
+    Keys are lowercased for attributes; 'name' and 'value' kept as identifiers.
+    """
     parts = [p.strip() for p in line.split(";")]
     if not parts:
         return {}
-    cookie = {}
+    cookie: Dict[str, str] = {}
     name_val = parts[0]
     if "=" in name_val:
         n, v = name_val.split("=", 1)
@@ -121,7 +132,7 @@ def analyze_headers(
                                     severity=sev, description=desc, recommendation=rec))
 
     # Summary flags
-    summary = {
+    summary: Dict[str, bool] = {
         "has_csp": False,
         "has_hsts": False,
         "has_xfo": False,
@@ -190,12 +201,11 @@ def analyze_headers(
             "Content-Security-Policy missing",
             _sev(1),  # HIGH
             "No CSP reduces XSS and injection resilience.",
-            "Add a CSP, e.g., 'Content-Security-Policy: default-src 'self'; frame-ancestors 'self'; object-src 'none'; base-uri 'self''.",
+            "Add a CSP, e.g., \"Content-Security-Policy: default-src 'self'; frame-ancestors 'self'; object-src 'none'; base-uri 'self'\".",
             penalty=12
         )
     else:
         summary["has_csp"] = True
-        # Simple risk heuristics
         csp_lower = csp.lower()
         if "'unsafe-inline'" in csp_lower or "'unsafe-eval'" in csp_lower:
             add_issue(
@@ -377,7 +387,7 @@ def analyze_headers(
 
     # --- Caching (sensitive contexts) ---
     cache_ctrl = (headers.get("cache-control") or "").lower()
-    pragma = (headers.get("pragma") or "").lower()
+    # pragma = (headers.get("pragma") or "").lower()  # not needed for logic below
     is_sensitive = has_password_form or _is_login_like_url(url)
 
     if is_sensitive and is_html:
@@ -411,7 +421,6 @@ def analyze_headers(
     # --- Deprecated Headers ---
     x_xss = (headers.get("x-xss-protection") or "").strip()
     if x_xss:
-        # It's deprecated; if set to 0, note it's disabled
         add_issue(
             "XXSS_DEPRECATED",
             "X-XSS-Protection header is deprecated",
@@ -423,6 +432,4 @@ def analyze_headers(
 
     # Clamp score and return
     score = max(0, min(100, score))
-
     return score, issues, summary
-``
