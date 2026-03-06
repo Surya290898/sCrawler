@@ -2,7 +2,6 @@ from dataclasses import dataclass, asdict
 from typing import List, Dict, Any, Optional
 import pandas as pd
 from urllib.parse import urlparse
-import json
 
 # -----------------------------
 # Core page finding dataclass
@@ -68,7 +67,7 @@ def issues_to_json(issues: List[Issue]) -> bytes:
     return df.to_json(orient="records", indent=2).encode("utf-8")
 
 def overall_site_score(findings: List[PageFinding]) -> int:
-    """Weighted average leaning toward worst pages (legacy helper)."""
+    """Simple mean of page scores (legacy helper)."""
     if not findings:
         return 0
     scores = [max(0, min(100, f.security_score)) for f in findings]
@@ -81,11 +80,10 @@ def overall_site_score(findings: List[PageFinding]) -> int:
 # Unique Findings Aggregation
 # -----------------------------
 
-# Heuristic “fix location” hints per check family
+# Heuristic “fix location” hints per check family (canonical header keys)
 _FIX_HINTS = {
-    # CSP/HSTS and core headers → usually global server/app headers
-    "CSP": "Web server / application global response headers (CSP policy)",
-    "HSTS": "Web server / reverse proxy (HTTPS only) — Strict-Transport-Security",
+    "Content-Security-Policy": "Web server / application global response headers (CSP policy)",
+    "Strict-Transport-Security": "Web server / reverse proxy (HTTPS only) — Strict-Transport-Security",
     "X-Frame-Options": "Web server / application global headers",
     "X-Content-Type-Options": "Web server / application global headers",
     "Referrer-Policy": "Web server / application global headers",
@@ -95,43 +93,50 @@ _FIX_HINTS = {
     "Cross-Origin-Embedder-Policy": "Web server / application global headers (COEP)",
     "Cross-Origin-Opener-Policy": "Web server / application global headers (COOP)",
     "Expect-CT": "Web server / TLS config (deprecated header)",
-    # CORS
     "Access-Control-Allow-Origin": "API gateway / origin server CORS configuration",
     "Access-Control-Allow-Methods": "API gateway / origin server CORS configuration",
-    # Cookies
     "Set-Cookie": "Application/session middleware where cookies are set",
-    # Cache
     "Cache-Control": "Application cache policy / reverse proxy",
-    # Info disclosure
     "Server": "Web server banner / reverse proxy config",
     "X-Powered-By": "Application platform/framework configuration",
     "X-AspNet-Version": "Framework configuration",
-    # Other indicators
     "Directory listing": "Web server directory indexes"
 }
 
-def _header_family_from_issue_title(title: str, check_id: str) -> str:
+def _canonical_family_from_title_or_id(title: str, check_id: str) -> str:
     """
-    Try to infer the header/policy family to present a fix-once location.
-    Uses issue title first (parity-style titles), then falls back to check_id.
+    Normalize a finding into a canonical 'family' (header/policy name) so that
+    we can give a fix-once location. Returns canonical key used in _FIX_HINTS.
     """
     t = (title or "").lower()
     cid = (check_id or "").upper()
 
-    # Direct name matches from title
-    for key in [
-        "content-security-policy", "strict-transport-security",
-        "x-frame-options", "x-content-type-options", "referrer-policy",
-        "permissions-policy", "feature-policy",
-        "cross-origin-resource-policy", "cross-origin-embedder-policy", "cross-origin-opener-policy",
-        "expect-ct", "access-control-allow-origin", "access-control-allow-methods",
-        "set-cookie", "cache-control", "server", "x-powered-by", "x-aspnet-version",
-        "directory listing"
-    ]:
-        if key in t:
-            return key.title().replace("-", " ")
+    pairs = [
+        ("content-security-policy", "Content-Security-Policy"),
+        ("strict-transport-security", "Strict-Transport-Security"),
+        ("x-frame-options", "X-Frame-Options"),
+        ("x-content-type-options", "X-Content-Type-Options"),
+        ("referrer-policy", "Referrer-Policy"),
+        ("permissions-policy", "Permissions-Policy"),
+        ("feature-policy", "Feature-Policy"),
+        ("cross-origin-resource-policy", "Cross-Origin-Resource-Policy"),
+        ("cross-origin-embedder-policy", "Cross-Origin-Embedder-Policy"),
+        ("cross-origin-opener-policy", "Cross-Origin-Opener-Policy"),
+        ("expect-ct", "Expect-CT"),
+        ("access-control-allow-origin", "Access-Control-Allow-Origin"),
+        ("access-control-allow-methods", "Access-Control-Allow-Methods"),
+        ("set-cookie", "Set-Cookie"),
+        ("cache-control", "Cache-Control"),
+        ("x-powered-by", "X-Powered-By"),
+        ("x-aspnet-version", "X-AspNet-Version"),
+        ("server", "Server"),
+        ("directory listing", "Directory listing"),
+    ]
+    for needle, canon in pairs:
+        if needle in t:
+            return canon
 
-    # Derive from check_id prefixes
+    # Fallback to check_id families
     if cid.startswith("CSP"):
         return "Content-Security-Policy"
     if cid.startswith("HSTS"):
@@ -147,18 +152,19 @@ def _header_family_from_issue_title(title: str, check_id: str) -> str:
     if cid.startswith("DIR_LISTING"):
         return "Directory listing"
 
-    # Default fallback
-    return "Web server / application"
+    return "Server"  # generic
+
+def _host_from_url(u: str) -> str:
+    try:
+        return urlparse(u).netloc or ""
+    except Exception:
+        return ""
 
 def _longest_common_path_prefix(urls: List[str]) -> str:
-    """
-    Compute a path-prefix hint across urls: /a/b/ ; returns '/' if no commonality.
-    """
     paths = []
     for u in urls:
         try:
             p = urlparse(u)
-            # normalize
             segs = [s for s in (p.path or "/").split("/") if s]
             paths.append(segs)
         except Exception:
@@ -176,8 +182,8 @@ def _longest_common_path_prefix(urls: List[str]) -> str:
     return "/" + "/".join(prefix) + ("/" if prefix else "")
 
 def aggregate_unique_findings(
-    issues_df: Optional(pd.DataFrame),
-    pages_df: Optional(pd.DataFrame) = None
+    issues_df: Optional[pd.DataFrame],
+    pages_df: Optional[pd.DataFrame] = None
 ) -> pd.DataFrame:
     """
     Collapse per-page issues into unique, fix-once items per (seed, host, check_id, title, severity).
@@ -195,13 +201,7 @@ def aggregate_unique_findings(
 
     df = issues_df.copy()
 
-    # derive host and seed (if present)
-    def _host_from_url(u: str) -> str:
-        try:
-            return urlparse(u).netloc or ""
-        except Exception:
-            return ""
-
+    # Enrich with host and seed
     if "url" in df.columns:
         df["host"] = df["url"].apply(_host_from_url)
     else:
@@ -210,16 +210,15 @@ def aggregate_unique_findings(
     if "seed" not in df.columns:
         df["seed"] = ""
 
-    # group key
+    # Grouping key
     group_cols = ["seed", "host", "check_id", "title", "severity"]
 
-    # helper: per-host page totals to compute coverage
+    # Totals per (seed, host) to compute coverage
     totals_map: Dict[tuple, int] = {}
     if pages_df is not None and not pages_df.empty:
         pp = pages_df.copy()
-        # where do we get host? from final_url
         if "final_url" in pp.columns:
-            pp["host"] = pp["final_url"].apply(lambda u: urlparse(u).netloc if isinstance(u, str) else "")
+            pp["host"] = pp["final_url"].apply(_host_from_url)
         else:
             pp["host"] = ""
         if "seed" not in pp.columns:
@@ -236,19 +235,15 @@ def aggregate_unique_findings(
         total_pages = totals_map.get((seed, host), 0)
         coverage = (affected_pages / total_pages) if total_pages > 0 else None
 
-        # scope inference
+        # Scope inference
         scope = "page-level"
         if coverage is not None and coverage >= 0.8 and affected_pages >= 5:
             scope = "site-wide (likely global header/policy)"
         elif affected_pages >= 3:
-            # derive path prefix
             prefix = _longest_common_path_prefix(list(g["url"].dropna().unique()))
-            if prefix not in ("/", ""):
-                scope = f"path-segment ({prefix})"
-            else:
-                scope = "multiple pages"
+            scope = f"path-segment ({prefix})" if prefix not in ("/", "") else "multiple pages"
 
-        family = _header_family_from_issue_title(title, check_id)
+        family = _canonical_family_from_title_or_id(title, check_id)
         fix_hint_location = _FIX_HINTS.get(family, "Web server / application global configuration")
 
         rows.append({
@@ -266,7 +261,7 @@ def aggregate_unique_findings(
 
     agg = pd.DataFrame(rows)
 
-    # Stable sort: by severity rank then affected_pages desc
+    # Stable sort: severity then affected_pages desc
     sev_rank = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
     if not agg.empty:
         agg["__sev_rank"] = agg["severity"].map(lambda s: sev_rank.get(s, 9))
