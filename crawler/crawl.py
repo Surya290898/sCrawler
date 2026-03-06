@@ -1,16 +1,16 @@
 import asyncio
 import random
-from typing import Set, Deque, List, Tuple
+from typing import Set, Deque, List
 from collections import deque
+from urllib.parse import urlparse
 import aiohttp
 from bs4 import BeautifulSoup
 from yarl import URL
 
-from .utils import normalize_url, should_enqueue, is_within_scope_host
+from .utils import normalize_url, should_enqueue, same_registrable_domain, is_within_scope_host
 from .robots import load_robots, can_fetch, parse_sitemap, fetch_text
 from .auth import AuthConfig, apply_cookie_header, perform_form_login, build_session_kwargs
-from .report import PageFinding, Issue
-from .security_audit import analyze_headers
+from .report import PageFinding
 
 DEFAULT_UA = "Crawler-For-Authorized-Assessment/1.0 (+https://example.com) StreamlitClient"
 
@@ -47,13 +47,13 @@ class Crawler:
         self.exclude_prefixes = exclude_prefixes or []
         self.auth = auth or AuthConfig()
 
+        # scope host token(s)
         self.scope = set()
-        self.scope_token = None
+        self.scope_token = None  # registrable domain token if allow_subdomains
         self._init_scope()
 
         self.visited: Set[str] = set()
         self.findings: List[PageFinding] = []
-        self.issues: List[Issue] = []
         self.sem = asyncio.Semaphore(concurrency)
 
     def _init_scope(self):
@@ -61,6 +61,7 @@ class Crawler:
         if not self.allow_subdomains:
             self.scope = {host}
         else:
+            # Store registrable domain token in scope, checked in utils
             from tldextract import extract
             ext = extract(host)
             token = f"{ext.domain}.{ext.suffix}" if ext.suffix else ext.domain
@@ -73,23 +74,17 @@ class Crawler:
 
         session_kwargs = build_session_kwargs(self.auth)
         timeout = aiohttp.ClientTimeout(total=30)
-        connector = aiohttp.TCPConnector(ssl=False, limit=0)  # semaphore controls concurrency
+        connector = aiohttp.TCPConnector(ssl=False, limit=0)  # let semaphore gate concurrency
 
-        async with aiohttp.ClientSession(
-            headers=headers,
-            timeout=timeout,
-            connector=connector,
-            trust_env=True,
-            raise_for_status=False,
-            **session_kwargs
-        ) as session:
-            # Optional authorized login (no bypassing)
+        async with aiohttp.ClientSession(headers=headers, timeout=timeout, connector=connector, trust_env=True, raise_for_status=False) as session:
+            # optional form login
             await perform_form_login(session, self.auth)
 
             rp, sitemaps = await load_robots(session, self.start_url, self.user_agent)
 
-            # Seed set: start_url + sitemap URLs (limited)
+            # Seed URLs
             seeds = set([self.start_url])
+            # parse sitemap(s) (limited)
             for sm in sitemaps[:5]:
                 xml = await fetch_text(session, sm)
                 if xml:
@@ -98,7 +93,7 @@ class Crawler:
                         if nu:
                             seeds.add(nu)
 
-            # BFS queue
+            # BFS crawl
             queue: Deque[tuple[str, int]] = deque()
             for s in seeds:
                 if should_enqueue(s, self.start_url, self.scope, self.allow_subdomains, self.exclude_prefixes):
@@ -116,33 +111,18 @@ class Crawler:
                 await self.sem.acquire()
                 asyncio.create_task(self._fetch_and_process(session, url, depth, queue))
 
+            # Wait for all tasks to finish
             await self._drain()
 
     async def _drain(self):
-        # Wait until all scheduled fetch tasks release the semaphore
+        # Wait until semaphore is fully released (i.e., all tasks done)
         while self.sem._value != self.concurrency:  # type: ignore[attr-defined]
             await asyncio.sleep(0.05)
 
-    def _headers_to_flat(self, hdrs: aiohttp.typedefs.LooseHeaders) -> dict:
-        """
-        Convert response headers to a case-preserving flat dict where repeated headers (e.g., Set-Cookie)
-        are joined with newline separators so we don't lose multiples.
-        """
-        flat: dict = {}
-        try:
-            # hdrs is CIMultiDictProxy
-            for k in hdrs.keys():
-                vals = hdrs.getall(k)
-                flat[k] = "\n".join(vals)
-        except Exception:
-            # fallback
-            for k, v in hdrs.items():
-                flat[k] = v
-        return flat
-
     async def _fetch_and_process(self, session: aiohttp.ClientSession, url: str, depth: int, queue):
         try:
-            await asyncio.sleep(random.uniform(*self.rate_delay_range))
+            delay = random.uniform(*self.rate_delay_range)
+            await asyncio.sleep(delay)
             async with session.get(url, allow_redirects=True) as resp:
                 final_url = str(resp.url)
                 status = resp.status
@@ -164,14 +144,11 @@ class Crawler:
                     if resp.headers.get(h):
                         hdr_flags[key] = True
 
-                is_html = ("text/html" in (ctype or "").lower()) and status < 400
-
-                if is_html:
+                # parse HTML for links/forms
+                if "text/html" in ctype and status < 400:
                     try:
                         text = await resp.text(errors="ignore")
-                        # Use built-in parser to avoid lxml dependency on Streamlit Cloud
-                        soup = BeautifulSoup(text, "html.parser")
-
+                        soup = BeautifulSoup(text, "lxml")
                         ttag = soup.find("title")
                         title = (ttag.text.strip() if ttag else "")[:200]
 
@@ -200,38 +177,12 @@ class Crawler:
                         # enqueue next
                         if depth < self.max_depth:
                             for u in next_urls:
-                                if u not in self.visited and should_enqueue(
-                                    u, self.start_url, self.scope, self.allow_subdomains, self.exclude_prefixes
-                                ):
+                                if u not in self.visited and should_enqueue(u, self.start_url, self.scope, self.allow_subdomains, self.exclude_prefixes):
+                                    # simple dedupe: push if not already planned
                                     queue.append((u, depth + 1))
                     except Exception:
-                        # swallow parsing errors to keep crawl running
                         pass
 
-                # --- Security audit on headers (passive) ---
-                flat_headers = self._headers_to_flat(resp.headers)
-                page_score, sec_issues, _summary = analyze_headers(
-                    url=final_url,
-                    status=status,
-                    headers_in=flat_headers,
-                    scheme=scheme,
-                    is_html=is_html,
-                    has_password_form=has_pwd,
-                    page_title=title,  # <-- enables directory-listing indicator & other heuristics
-                )
-
-                # Store issues
-                for si in sec_issues:
-                    self.issues.append(Issue(
-                        url=si.url,
-                        check_id=si.check_id,
-                        title=si.title,
-                        severity=si.severity,
-                        description=si.description,
-                        recommendation=si.recommendation
-                    ))
-
-                # Store page finding
                 self.findings.append(PageFinding(
                     url=url,
                     final_url=final_url,
@@ -251,11 +202,9 @@ class Crawler:
                     hdr_hsts=hdr_flags["hdr_hsts"],
                     hdr_xcto=hdr_flags["hdr_xcto"],
                     hdr_refpol=hdr_flags["hdr_refpol"],
-                    security_score=page_score
                 ))
-
         except Exception:
-            # Keep crawling even if a single fetch fails
+            # swallow to continue
             pass
         finally:
             self.sem.release()
