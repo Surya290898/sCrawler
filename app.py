@@ -10,13 +10,33 @@ from crawler.report import (
     overall_site_score
 )
 
+# -------------------------
+# Page config
+# -------------------------
 st.set_page_config(page_title="Authorized Crawler", page_icon="🕷️", layout="wide")
-
 st.title("🕷️ Authorized Web Crawler")
 st.caption("For in-scope, authorized discovery only. Passive header analysis — no bypassing protections.")
 
+# -------------------------
+# Session state init
+# -------------------------
+if "results_pages_df" not in st.session_state:
+    st.session_state.results_pages_df = None
+if "results_issues_df" not in st.session_state:
+    st.session_state.results_issues_df = None
+if "site_score" not in st.session_state:
+    st.session_state.site_score = None
+if "last_params" not in st.session_state:
+    st.session_state.last_params = {}
+if "message" not in st.session_state:
+    st.session_state.message = None
+
+# -------------------------
+# Sidebar controls
+# -------------------------
 with st.sidebar:
     st.header("Scope & Limits")
+
     start_url = st.text_input("Start URL", placeholder="https://example.com")
     allow_subdomains = st.checkbox("Allow subdomains", True)
     max_depth = st.number_input("Max depth", min_value=0, max_value=10, value=3)
@@ -60,14 +80,34 @@ with st.sidebar:
         height=90
     ).splitlines()
 
-    run_button = st.button("Start Crawl")
+    cols_sidebar = st.columns([1, 1])
+    with cols_sidebar[0]:
+        run_button = st.button("Start Crawl", type="primary")
+    with cols_sidebar[1]:
+        reset_button = st.button("New scan / Reset", help="Clear results and start a new scan")
 
+# -------------------------
+# Reset flow
+# -------------------------
+if reset_button:
+    st.session_state.results_pages_df = None
+    st.session_state.results_issues_df = None
+    st.session_state.site_score = None
+    st.session_state.last_params = {}
+    st.session_state.message = "State cleared. Configure parameters and click Start Crawl."
+    st.experimental_rerun()
+
+# -------------------------
+# Run crawl (on demand)
+# -------------------------
 if run_button:
     if not start_url:
         st.error("Please provide a Start URL.")
         st.stop()
 
+    # Keep a message visible during run; since Streamlit reruns, we show a static info
     st.info("Crawling… This may take a while depending on limits and target size.")
+
     auth = AuthConfig(
         basic_user=basic_user,
         basic_pass=basic_pass,
@@ -103,13 +143,40 @@ if run_button:
         st.warning("No pages crawled. Check scope/limits/auth or try again.")
         st.stop()
 
+    # Build DataFrames once and persist in session_state
     df_pages = to_dataframe(findings)
     df_issues = issues_to_dataframe(issues)
-
-    # --- KPI Summary ---
     site_score = overall_site_score(findings)
-    st.success(f"Crawl finished. Pages visited: {len(df_pages)}  |  Overall Site Score: {site_score}/100")
 
+    st.session_state.results_pages_df = df_pages
+    st.session_state.results_issues_df = df_issues
+    st.session_state.site_score = site_score
+    st.session_state.last_params = {
+        "start_url": start_url,
+        "allow_subdomains": allow_subdomains,
+        "max_depth": int(max_depth),
+        "max_pages": int(max_pages),
+        "concurrency": int(concurrency),
+        "respect_robots": bool(respect_robots),
+        "rate_range": (float(rate_min), float(rate_max)) if rate_max >= rate_min else (float(rate_max), float(rate_min)),
+        "ua": ua.strip() or DEFAULT_UA,
+        "exclude_prefixes": [p.strip() for p in exclude_prefixes if p.strip()],
+        "auth_mode": auth_mode,
+    }
+
+# -------------------------
+# Results view (persistent)
+# -------------------------
+if st.session_state.results_pages_df is not None:
+    df_pages = st.session_state.results_pages_df
+    df_issues = st.session_state.results_issues_df
+    site_score = int(st.session_state.site_score or 0)
+
+    st.success(
+        f"Crawl finished. Pages visited: {len(df_pages)}  |  Overall Site Score: {site_score}/100"
+    )
+
+    # KPIs
     c1, c2, c3, c4 = st.columns(4)
     with c1:
         st.metric("Avg Page Score", int(df_pages["security_score"].mean()))
@@ -120,9 +187,9 @@ if run_button:
     with c4:
         st.metric("HTTP errors (>=400)", int((df_pages['status'] >= 400).sum()))
 
-    # --- Severity Breakdown ---
+    # Severity Breakdown
     st.subheader("Severity Breakdown")
-    if not df_issues.empty:
+    if df_issues is not None and not df_issues.empty:
         sev_counts = df_issues["severity"].value_counts().reindex(
             ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"], fill_value=0
         )
@@ -130,7 +197,7 @@ if run_button:
     else:
         st.info("No issues detected by header audit.")
 
-    # --- Pages Table ---
+    # Pages Table
     with st.expander("📄 Pages (with security score)", expanded=True):
         cols = [
             "final_url","status","title","content_type",
@@ -142,9 +209,9 @@ if run_button:
         view = df_pages[cols].sort_values(by="security_score")
         st.dataframe(view, use_container_width=True, hide_index=True)
 
-    # --- Issues Table ---
+    # Issues Table
     with st.expander("🛡️ Issues (OWASP-aligned)", expanded=True):
-        if not df_issues.empty:
+        if df_issues is not None and not df_issues.empty:
             sev_filter = st.multiselect(
                 "Filter by severity",
                 options=["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"],
@@ -158,18 +225,52 @@ if run_button:
         else:
             st.info("No issues flagged.")
 
-    # --- Downloads ---
+    # Downloads (use cached DFs so page stays as-is after click)
     st.subheader("Downloads")
     cdl1, cdl2, cdl3, cdl4 = st.columns(4)
     with cdl1:
-        st.download_button("⬇️ Pages CSV", data=df_pages.to_csv(index=False).encode("utf-8"), file_name="pages.csv", mime="text/csv")
+        st.download_button(
+            "⬇️ Pages CSV",
+            data=df_pages.to_csv(index=False).encode("utf-8"),
+            file_name="pages.csv",
+            mime="text/csv",
+            key="dl_pages_csv"
+        )
     with cdl2:
-        st.download_button("⬇️ Pages JSON", data=df_pages.to_json(orient="records", indent=2).encode("utf-8"), file_name="pages.json", mime="application/json")
+        st.download_button(
+            "⬇️ Pages JSON",
+            data=df_pages.to_json(orient="records", indent=2).encode("utf-8"),
+            file_name="pages.json",
+            mime="application/json",
+            key="dl_pages_json"
+        )
     with cdl3:
-        st.download_button("⬇️ Issues CSV", data=df_issues.to_csv(index=False).encode("utf-8"), file_name="issues.csv", mime="text/csv")
+        if df_issues is not None:
+            st.download_button(
+                "⬇️ Issues CSV",
+                data=df_issues.to_csv(index=False).encode("utf-8"),
+                file_name="issues.csv",
+                mime="text/csv",
+                key="dl_issues_csv"
+            )
     with cdl4:
-        st.download_button("⬇️ Issues JSON", data=df_issues.to_json(orient="records", indent=2).encode("utf-8"), file_name="issues.json", mime="application/json")
+        if df_issues is not None:
+            st.download_button(
+                "⬇️ Issues JSON",
+                data=df_issues.to_json(orient="records", indent=2).encode("utf-8"),
+                file_name="issues.json",
+                mime="application/json",
+                key="dl_issues_json"
+            )
 
-    st.caption("Note: Passive header analysis for authorized assessments within defined scope.")
+    if st.session_state.message:
+        st.info(st.session_state.message)
+        st.session_state.message = None
+
 else:
-    st.info("Configure scope/auth in the sidebar and click **Start Crawl**.")
+    # Home view (only shows when no results are cached)
+    if st.session_state.message:
+        st.info(st.session_state.message)
+        st.session_state.message = None
+    else:
+        st.info("Configure scope/auth in the sidebar and click **Start Crawl**.")
