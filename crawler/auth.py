@@ -1,3 +1,4 @@
+# auth.py
 import aiohttp
 from yarl import URL
 
