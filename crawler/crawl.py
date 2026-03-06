@@ -10,7 +10,7 @@ from .utils import normalize_url, should_enqueue, is_within_scope_host
 from .robots import load_robots, can_fetch, parse_sitemap, fetch_text
 from .auth import AuthConfig, apply_cookie_header, perform_form_login, build_session_kwargs
 from .report import PageFinding, Issue
-from .security_audit import analyze_headers, SecurityIssue
+from .security_audit import analyze_headers
 
 DEFAULT_UA = "Crawler-For-Authorized-Assessment/1.0 (+https://example.com) StreamlitClient"
 
@@ -73,13 +73,22 @@ class Crawler:
 
         session_kwargs = build_session_kwargs(self.auth)
         timeout = aiohttp.ClientTimeout(total=30)
-        connector = aiohttp.TCPConnector(ssl=False, limit=0)
+        connector = aiohttp.TCPConnector(ssl=False, limit=0)  # semaphore controls concurrency
 
-        async with aiohttp.ClientSession(headers=headers, timeout=timeout, connector=connector, trust_env=True, raise_for_status=False, **session_kwargs) as session:
+        async with aiohttp.ClientSession(
+            headers=headers,
+            timeout=timeout,
+            connector=connector,
+            trust_env=True,
+            raise_for_status=False,
+            **session_kwargs
+        ) as session:
+            # Optional authorized login (no bypassing)
             await perform_form_login(session, self.auth)
 
             rp, sitemaps = await load_robots(session, self.start_url, self.user_agent)
 
+            # Seed set: start_url + sitemap URLs (limited)
             seeds = set([self.start_url])
             for sm in sitemaps[:5]:
                 xml = await fetch_text(session, sm)
@@ -89,6 +98,7 @@ class Crawler:
                         if nu:
                             seeds.add(nu)
 
+            # BFS queue
             queue: Deque[tuple[str, int]] = deque()
             for s in seeds:
                 if should_enqueue(s, self.start_url, self.scope, self.allow_subdomains, self.exclude_prefixes):
@@ -109,6 +119,7 @@ class Crawler:
             await self._drain()
 
     async def _drain(self):
+        # Wait until all scheduled fetch tasks release the semaphore
         while self.sem._value != self.concurrency:  # type: ignore[attr-defined]
             await asyncio.sleep(0.05)
 
@@ -153,12 +164,14 @@ class Crawler:
                     if resp.headers.get(h):
                         hdr_flags[key] = True
 
-                is_html = ("text/html" in ctype.lower()) and status < 400
+                is_html = ("text/html" in (ctype or "").lower()) and status < 400
 
                 if is_html:
                     try:
                         text = await resp.text(errors="ignore")
-                        soup = BeautifulSoup(text, "lxml")
+                        # Use built-in parser to avoid lxml dependency on Streamlit Cloud
+                        soup = BeautifulSoup(text, "html.parser")
+
                         ttag = soup.find("title")
                         title = (ttag.text.strip() if ttag else "")[:200]
 
@@ -184,15 +197,18 @@ class Crawler:
                                 if URL(final_url).scheme == "http":
                                     pwd_over_http = True
 
-                        # enqueue
+                        # enqueue next
                         if depth < self.max_depth:
                             for u in next_urls:
-                                if u not in self.visited and should_enqueue(u, self.start_url, self.scope, self.allow_subdomains, self.exclude_prefixes):
+                                if u not in self.visited and should_enqueue(
+                                    u, self.start_url, self.scope, self.allow_subdomains, self.exclude_prefixes
+                                ):
                                     queue.append((u, depth + 1))
                     except Exception:
+                        # swallow parsing errors to keep crawl running
                         pass
 
-                # --- Security audit on headers ---
+                # --- Security audit on headers (passive) ---
                 flat_headers = self._headers_to_flat(resp.headers)
                 page_score, sec_issues, _summary = analyze_headers(
                     url=final_url,
@@ -203,7 +219,7 @@ class Crawler:
                     has_password_form=has_pwd
                 )
 
-                # Map SecurityIssue -> Issue dataclass
+                # Store issues
                 for si in sec_issues:
                     self.issues.append(Issue(
                         url=si.url,
@@ -214,6 +230,7 @@ class Crawler:
                         recommendation=si.recommendation
                     ))
 
+                # Store page finding
                 self.findings.append(PageFinding(
                     url=url,
                     final_url=final_url,
@@ -237,6 +254,7 @@ class Crawler:
                 ))
 
         except Exception:
+            # Keep crawling even if a single fetch fails
             pass
         finally:
             self.sem.release()
