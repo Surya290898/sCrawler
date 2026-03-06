@@ -216,7 +216,8 @@ class Crawler:
                     headers_in=flat_headers,
                     scheme=scheme,
                     is_html=is_html,
-                    has_password_form=has_pwd
+                    has_password_form=has_pwd,
+                    page_title=title,  # <-- enables directory-listing indicator & other heuristics
                 )
 
                 # Store issues
