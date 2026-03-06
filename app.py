@@ -10,14 +10,24 @@ from crawler.auth import AuthConfig
 from crawler.report import (
     to_dataframe, to_csv, to_json,
     issues_to_dataframe, issues_to_csv, issues_to_json,
-    overall_site_score
+    overall_site_score,
+    # The following exist if you adopted the unique-findings feature.
+    # If not present in your repo, you can comment them out and the related UI section.
+    aggregate_unique_findings, unique_findings_to_csv, unique_findings_to_json
 )
+
+# Optional Playwright-based crawler (JS Mode)
+try:
+    from crawler.browser_crawl import BrowserCrawler, _PLAYWRIGHT_AVAILABLE
+except Exception:
+    BrowserCrawler = None
+    _PLAYWRIGHT_AVAILABLE = False
 
 # -------------------------
 # Page config
 # -------------------------
-st.set_page_config(page_title="Scrawler-V", page_icon="🕷️", layout="wide")
-st.title("🕷️ Scrawler-V")
+st.set_page_config(page_title="Authorized Crawler", page_icon="🕷️", layout="wide")
+st.title("🕷️ Authorized Web Crawler")
 st.caption("For in-scope, authorized discovery only. Passive header analysis — no bypassing protections.")
 
 # -------------------------
@@ -26,6 +36,7 @@ st.caption("For in-scope, authorized discovery only. Passive header analysis —
 for key, default in [
     ("results_pages_df", None),
     ("results_issues_df", None),
+    ("results_unique_df", None),
     ("site_score", None),
     ("last_params", {}),
     ("message", None),
@@ -49,6 +60,7 @@ def _read_targets_from_file(uploaded_file) -> list[str]:
     try:
         name = (uploaded_file.name or "").lower()
         if name.endswith(".xlsx") or name.endswith(".xls"):
+            # Requires openpyxl in requirements
             df = pd.read_excel(uploaded_file, engine="openpyxl")
         elif name.endswith(".csv"):
             df = pd.read_csv(uploaded_file)
@@ -59,7 +71,7 @@ def _read_targets_from_file(uploaded_file) -> list[str]:
         if df.empty:
             return []
 
-        # Select column
+        # Select column by heuristic
         cand = [c for c in df.columns if str(c).strip().lower() in ("url", "urls", "target", "targets")]
         col = cand[0] if cand else df.columns[0]
         series = df[col].dropna()
@@ -133,7 +145,7 @@ def _build_severity_chart(df_issues: pd.DataFrame):
 with st.sidebar:
     st.header("Scan Targets")
 
-    # Single URL (kept as-is)
+    # Single URL (optional)
     start_url = st.text_input("Single URL (optional)", placeholder="https://example.com")
 
     # Bulk URLs via file
@@ -180,6 +192,18 @@ with st.sidebar:
                     k, v = line.split("=", 1)
                     extra[k.strip()] = v.strip()
 
+    st.header("JavaScript (Playwright) [beta]")
+    enable_js = st.checkbox(
+        "Enable JavaScript rendering (SPA/JS links)",
+        value=False,
+        help="Requires Playwright/Chromium. If unavailable, the app will fall back to the fast HTTP crawler."
+    )
+    clicks_per_page = st.slider(
+        "Click exploration per page (same-origin only)",
+        min_value=0, max_value=3, value=0,
+        help="Try a few safe button/link clicks to discover client-side routes (0 = disabled)."
+    )
+
     st.markdown("---")
     exclude_prefixes = st.text_area(
         "Exclude URL prefixes (one per line)",
@@ -199,6 +223,7 @@ with st.sidebar:
 if reset_button:
     st.session_state.results_pages_df = None
     st.session_state.results_issues_df = None
+    st.session_state.results_unique_df = None
     st.session_state.site_score = None
     st.session_state.last_params = {}
     st.session_state.message = "State cleared. Configure parameters and click Start Crawl."
@@ -232,8 +257,8 @@ if run_button:
     st.info(f"Starting crawl for {len(targets)} target(s). This may take a while depending on limits and site sizes.")
     progress = st.progress(0)
 
-    # Auth config (same for all targets)
-    auth = AuthConfig(
+    # Auth config (for HTTP crawler). For JS mode we pass parts directly.
+    auth_cfg = AuthConfig(
         basic_user=basic_user,
         basic_pass=basic_pass,
         cookie_string=cookie_string,
@@ -249,24 +274,59 @@ if run_button:
     all_issues: list[pd.DataFrame] = []
 
     for idx, target in enumerate(targets, start=1):
-        # Build crawler per target
-        crawler = Crawler(
-            start_url=target,
-            allow_subdomains=allow_subdomains,
-            max_depth=int(max_depth),
-            max_pages=int(max_pages),
-            concurrency=int(concurrency),
-            respect_robots=bool(respect_robots),
-            rate_delay_range=(float(rate_min), float(rate_max)) if rate_max >= rate_min else (float(rate_max), float(rate_min)),
-            user_agent=ua.strip() or DEFAULT_UA,
-            exclude_prefixes=[p.strip() for p in exclude_prefixes if p.strip()],
-            auth=auth,
-        )
+        # Decide mode
+        if enable_js:
+            if not _PLAYWRIGHT_AVAILABLE or BrowserCrawler is None:
+                st.warning(
+                    "Playwright (Chromium) is not available in this runtime. "
+                    "Falling back to the fast HTTP crawler for this run."
+                )
+                use_js = False
+            else:
+                use_js = True
+        else:
+            use_js = False
 
-        async def run_and_collect():
-            await crawler.run()
-            return crawler.findings, crawler.issues
+        if use_js:
+            crawler = BrowserCrawler(
+                start_url=target,
+                allow_subdomains=allow_subdomains,
+                max_depth=int(max_depth),
+                max_pages=int(max_pages),
+                concurrency=max(1, int(min(concurrency, 6))),  # JS is heavier; cap concurrency
+                rate_delay_range=(float(rate_min), float(rate_max)) if rate_max >= rate_min else (float(rate_max), float(rate_min)),
+                user_agent=ua.strip() or DEFAULT_UA,
+                exclude_prefixes=[p.strip() for p in exclude_prefixes if p.strip()],
+                cookie_string=cookie_string,
+                basic_user=basic_user,
+                basic_pass=basic_pass,
+                enable_safe_clicks=(clicks_per_page > 0),
+                max_clicks_per_page=int(clicks_per_page),
+            )
 
+            async def run_and_collect():
+                await crawler.run()
+                return crawler.findings, crawler.issues
+
+        else:
+            crawler = Crawler(
+                start_url=target,
+                allow_subdomains=allow_subdomains,
+                max_depth=int(max_depth),
+                max_pages=int(max_pages),
+                concurrency=int(concurrency),
+                respect_robots=bool(respect_robots),
+                rate_delay_range=(float(rate_min), float(rate_max)) if rate_max >= rate_min else (float(rate_max), float(rate_min)),
+                user_agent=ua.strip() or DEFAULT_UA,
+                exclude_prefixes=[p.strip() for p in exclude_prefixes if p.strip()],
+                auth=auth_cfg,
+            )
+
+            async def run_and_collect():
+                await crawler.run()
+                return crawler.findings, crawler.issues
+
+        # Run (both modes return findings, issues)
         findings, issues = asyncio.run(run_and_collect())
 
         # Convert to DataFrames
@@ -288,18 +348,35 @@ if run_button:
     df_issues_all = pd.concat(all_issues, ignore_index=True) if all_issues else pd.DataFrame()
 
     if df_pages_all.empty and df_issues_all.empty:
-        st.warning("No pages crawled or no issues found across the provided targets. Check scope/limits/auth and try again.")
+        st.warning("No pages crawled or no issues found across the provided targets.")
+        with st.expander("Debug tips", expanded=True):
+            st.markdown("""
+- **Robots blocked (HTTP mode)**: Uncheck **Respect robots.txt** in the sidebar and retry.
+- **Scope blocked**: Ensure **Allow subdomains** is correct. Start from the canonical (post-redirect) host.
+- **Depth/limits**: Increase **Max depth** (e.g., 3→5) and **Max pages** (e.g., 500→2000).
+- **Auth/redirects**: If the start URL redirects to login or a different host, use **Login Form**/**Cookie** auth, or start from a public in-scope page.
+- **SPA/JS navigation**: Enable **JavaScript (Playwright)** mode to discover client-side routes. If unavailable, deploy with Playwright + Chromium.
+- **Rate/timeouts**: For slow sites, increase **Rate delay** and retry.
+""")
         st.stop()
 
-    # Aggregate overall score (simple mean proxy)
+    # Aggregate overall score (simple mean proxy for display)
     try:
         site_score = int(df_pages_all["security_score"].mean()) if "security_score" in df_pages_all.columns and not df_pages_all.empty else 0
     except Exception:
         site_score = 0
 
+    # Unique (de-duplicated) findings with safety guard (if available in your report.py)
+    try:
+        df_unique = aggregate_unique_findings(df_issues_all, df_pages_all)
+    except Exception:
+        st.warning("Unique-findings aggregation failed on this run. Raw results are still available.")
+        df_unique = pd.DataFrame()
+
     # Persist in session_state
     st.session_state.results_pages_df = df_pages_all
     st.session_state.results_issues_df = df_issues_all
+    st.session_state.results_unique_df = df_unique
     st.session_state.site_score = site_score
     st.session_state.last_params = {
         "targets": targets,
@@ -312,6 +389,8 @@ if run_button:
         "ua": ua.strip() or DEFAULT_UA,
         "exclude_prefixes": [p.strip() for p in exclude_prefixes if p.strip()],
         "auth_mode": auth_mode,
+        "enable_js": enable_js,
+        "clicks_per_page": int(clicks_per_page),
     }
 
 # -------------------------
@@ -320,6 +399,7 @@ if run_button:
 if st.session_state.results_pages_df is not None:
     df_pages = st.session_state.results_pages_df
     df_issues = st.session_state.results_issues_df
+    df_unique = st.session_state.results_unique_df
     site_score = int(st.session_state.site_score or 0)
 
     total_pages = len(df_pages) if df_pages is not None else 0
@@ -338,7 +418,7 @@ if st.session_state.results_pages_df is not None:
     with c4:
         st.metric("HTTP errors (>=400)", int((df_pages['status'] >= 400).sum()) if ("status" in df_pages.columns) else 0)
 
-    # Severity Breakdown (Altair with custom colors; list-of-dicts to avoid Narwhals DuplicateError)
+    # Severity Breakdown (colored)
     st.subheader("Severity Breakdown")
     if df_issues is not None and not df_issues.empty and "severity" in df_issues.columns:
         chart = _build_severity_chart(df_issues)
@@ -346,9 +426,39 @@ if st.session_state.results_pages_df is not None:
     else:
         st.info("No issues detected by header audit.")
 
-    # Pages Table
-    with st.expander("📄 Pages (with security score)", expanded=True):
-        # Include 'seed' column if present
+    # Unique findings (fix-once view)
+    with st.expander("🧩 Unique findings (de-duplicated, fix-once guidance)", expanded=True):
+        if df_unique is not None and not df_unique.empty:
+            show_cols = ["seed", "host", "severity", "title", "check_id", "affected_pages", "coverage", "scope", "fix_hint_location", "sample_urls"]
+            show_cols = [c for c in show_cols if c in df_unique.columns]
+            view = df_unique.copy()
+            if "coverage" in view.columns:
+                view["coverage"] = view["coverage"].apply(lambda x: f"{x:.0%}" if pd.notnull(x) else "")
+            st.dataframe(view[show_cols], use_container_width=True, hide_index=True)
+
+            # Downloads
+            cdl_u1, cdl_u2 = st.columns(2)
+            with cdl_u1:
+                st.download_button(
+                    "⬇️ Unique findings CSV",
+                    data=unique_findings_to_csv(df_unique),
+                    file_name="unique_findings.csv",
+                    mime="text/csv",
+                    key="dl_unique_csv"
+                )
+            with cdl_u2:
+                st.download_button(
+                    "⬇️ Unique findings JSON",
+                    data=unique_findings_to_json(df_unique),
+                    file_name="unique_findings.json",
+                    mime="application/json",
+                    key="dl_unique_json"
+                )
+        else:
+            st.info("No unique findings aggregated (no issues found).")
+
+    # Pages Table (raw)
+    with st.expander("📄 Pages (with security score)", expanded=False):
         base_cols = [
             "seed" if "seed" in df_pages.columns else None,
             "final_url","status","title","content_type",
@@ -364,14 +474,15 @@ if st.session_state.results_pages_df is not None:
         else:
             st.info("No page columns available to display.")
 
-    # Issues Table
-    with st.expander("🛡️ Issues (OWASP-aligned)", expanded=True):
+    # Issues Table (raw, per page)
+    with st.expander("🛡️ Issues (full evidence, per page)", expanded=False):
         if df_issues is not None and not df_issues.empty:
             default_sev = ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"]
             sev_filter = st.multiselect(
                 "Filter by severity",
                 options=default_sev,
-                default=default_sev
+                default=default_sev,
+                key="sev_filter_full"
             )
             view_issues = df_issues[df_issues["severity"].isin(sev_filter)].copy() if "severity" in df_issues.columns else df_issues.copy()
             show_cols = ["seed"] if "seed" in view_issues.columns else []
@@ -384,8 +495,8 @@ if st.session_state.results_pages_df is not None:
         else:
             st.info("No issues flagged.")
 
-    # Downloads (use cached DFs so page stays as-is after click)
-    st.subheader("Downloads")
+    # Downloads (raw evidence)
+    st.subheader("Downloads (raw evidence)")
     cdl1, cdl2, cdl3, cdl4 = st.columns(4)
     with cdl1:
         st.download_button(
