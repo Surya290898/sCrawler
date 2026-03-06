@@ -1,25 +1,28 @@
 # crawler/browser_crawl.py
 import asyncio
+import random
 from collections import deque
 from typing import Deque, List, Set, Tuple, Optional
 
 from bs4 import BeautifulSoup
 from yarl import URL
-import random
 
 from .utils import normalize_url, should_enqueue, is_within_scope_host
 from .security_audit import analyze_headers
 from .report import PageFinding, Issue
 
-# Playwright is optional. We import lazily and guard failures.
+# Playwright is optional. Import guarded so the app can run without it.
 try:
     from playwright.async_api import async_playwright, Page, BrowserContext
     _PLAYWRIGHT_AVAILABLE = True
 except Exception:
+    BrowserContext = None  # type: ignore[assignment]
+    Page = None            # type: ignore[assignment]
     _PLAYWRIGHT_AVAILABLE = False
 
 
 DEFAULT_UA = "Crawler-For-Authorized-Assessment/1.0 (+https://example.com) JSClient"
+
 
 class BrowserCrawler:
     """
@@ -29,14 +32,18 @@ class BrowserCrawler:
     - Parses rendered DOM for anchors
     - Optional "safe clicks" on same-origin buttons/links (client-side routes)
     - Passive header audit only (no payloads)
+
+    This crawler sets `self.last_error` if Chromium/Context cannot start so the
+    caller (app.py) can auto-fallback to HTTP mode gracefully.
     """
+
     def __init__(
         self,
         start_url: str,
         allow_subdomains: bool = True,
         max_depth: int = 3,
         max_pages: int = 500,
-        concurrency: int = 3,                   # JS pages are heavier; keep lower than HTTP mode
+        concurrency: int = 3,  # JS pages are heavier; keep lower than HTTP mode
         rate_delay_range: tuple[float, float] = (0.1, 0.4),
         user_agent: str = DEFAULT_UA,
         exclude_prefixes: list[str] | None = None,
@@ -44,7 +51,7 @@ class BrowserCrawler:
         basic_user: str | None = None,
         basic_pass: str | None = None,
         enable_safe_clicks: bool = False,
-        max_clicks_per_page: int = 3,
+        max_clicks_per_page: int = 0,
     ):
         self.start_url = start_url
         self.allow_subdomains = allow_subdomains
@@ -64,10 +71,12 @@ class BrowserCrawler:
         self.issues: List[Issue] = []
         self.visited: Set[str] = set()
 
-        # basic scope token
         self.scope: Set[str] = set()
         self.scope_token: Optional[str] = None
         self._init_scope()
+
+        # Will contain a short string on launch/context failures; None on success.
+        self.last_error: Optional[str] = None
 
     def _init_scope(self):
         host = URL(self.start_url).host or ""
@@ -81,63 +90,113 @@ class BrowserCrawler:
             self.scope_token = token
 
     async def run(self):
+        """Run the JS crawler; set self.last_error on any startup failure."""
+        # default = no error
+        self.last_error = None
+
         if not _PLAYWRIGHT_AVAILABLE:
+            self.last_error = "Playwright library not available"
             return
 
         sem = asyncio.Semaphore(self.concurrency)
 
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            context_args = dict(
-                user_agent=self.user_agent,
-                ignore_https_errors=True,
-                java_script_enabled=True,
-                viewport={"width": 1366, "height": 882},
-            )
-            # Basic Auth if provided
-            if self.basic_user and self.basic_pass:
-                context_args["http_credentials"] = {"username": self.basic_user, "password": self.basic_pass}
-            # Cookie header as extra header
-            extra_headers = {}
-            if self.cookie_string:
-                extra_headers["Cookie"] = self.cookie_string
-            if extra_headers:
-                context_args["extra_http_headers"] = extra_headers
+        try:
+            # Lazy import inside run for extra safety
+            from playwright.async_api import async_playwright  # type: ignore
+            async with async_playwright() as p:
+                # ---- Launch Chromium (guarded) ----
+                try:
+                    browser = await p.chromium.launch(headless=True)
+                except Exception as e:
+                    # Most common on managed hosts without Chromium/OS deps
+                    self.last_error = f"Chromium launch failed: {type(e).__name__}"
+                    return
 
-            context: BrowserContext = await browser.new_context(**context_args)
+                # ---- Create context (guarded) ----
+                context_args = dict(
+                    user_agent=self.user_agent,
+                    ignore_https_errors=True,
+                    java_script_enabled=True,
+                    viewport={"width": 1366, "height": 882},
+                )
+                if self.basic_user and self.basic_pass:
+                    context_args["http_credentials"] = {
+                        "username": self.basic_user,
+                        "password": self.basic_pass,
+                    }
+                extra_headers = {}
+                if self.cookie_string:
+                    extra_headers["Cookie"] = self.cookie_string
+                if extra_headers:
+                    context_args["extra_http_headers"] = extra_headers
 
-            queue: Deque[Tuple[str, int]] = deque()
-            # Always enqueue the seed
-            if should_enqueue(self.start_url, self.start_url, self.scope, self.allow_subdomains, self.exclude_prefixes):
-                queue.append((self.start_url, 0))
+                try:
+                    context: BrowserContext = await browser.new_context(**context_args)  # type: ignore[assignment]
+                except Exception as e:
+                    self.last_error = f"Context init failed: {type(e).__name__}"
+                    try:
+                        await browser.close()
+                    except Exception:
+                        pass
+                    return
 
-            # Wave scheduler
-            while queue and len(self.visited) < self.max_pages:
-                tasks = []
-                for _ in range(min(self.concurrency, len(queue))):
-                    url, depth = queue.popleft()
-                    if url in self.visited:
-                        continue
-                    self.visited.add(url)
-                    tasks.append(asyncio.create_task(self._visit_one(context, url, depth, queue, sem)))
+                # ---- Wave scheduler (like HTTP mode) ----
+                queue: Deque[Tuple[str, int]] = deque()
+                if should_enqueue(self.start_url, self.start_url, self.scope, self.allow_subdomains, self.exclude_prefixes):
+                    queue.append((self.start_url, 0))
 
-                if not tasks:
-                    break
-                await asyncio.gather(*tasks)
+                while queue and len(self.visited) < self.max_pages:
+                    tasks = []
+                    for _ in range(min(self.concurrency, len(queue))):
+                        url, depth = queue.popleft()
+                        if url in self.visited:
+                            continue
+                        self.visited.add(url)
+                        tasks.append(asyncio.create_task(self._visit_one(context, url, depth, queue, sem)))
 
-            await context.close()
-            await browser.close()
+                    if not tasks:
+                        break
 
-    async def _visit_one(self, context: BrowserContext, url: str, depth: int, queue: Deque[Tuple[str, int]], sem: asyncio.Semaphore):
+                    try:
+                        await asyncio.gather(*tasks)
+                    except Exception:
+                        # Swallow page-level errors; keep crawling.
+                        pass
+
+                # ---- Cleanup ----
+                try:
+                    await context.close()
+                except Exception:
+                    pass
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
+
+        except Exception as e:
+            # Top-level unexpected error; signal to caller for fallback
+            self.last_error = f"Playwright run failed: {type(e).__name__}"
+            return
+
+    async def _visit_one(
+        self,
+        context: BrowserContext,
+        url: str,
+        depth: int,
+        queue: Deque[Tuple[str, int]],
+        sem: asyncio.Semaphore
+    ):
         async with sem:
-            # politeness
+            # Politeness delay
             await asyncio.sleep(random.uniform(*self.rate_delay_range))
 
-            page: Page = await context.new_page()
-            # Navigate; allow SPA bootstrap
+            # Open a new page for isolation
+            page: Page = await context.new_page()  # type: ignore[assignment]
+
+            # Navigate and allow SPA bootstrap
             resp = await page.goto(url, wait_until="networkidle", timeout=30000)
 
-            # Response details
+            # Collect response metadata
             headers = {}
             status = 0
             reason = ""
@@ -162,7 +221,7 @@ class BrowserCrawler:
             has_pwd = False
             pwd_over_http = (URL(final_url).scheme == "http")
 
-            # Rendered DOM parse
+            # Parse rendered DOM for anchors/forms
             if is_html:
                 try:
                     html = await page.content()
@@ -170,15 +229,11 @@ class BrowserCrawler:
                     ttag = soup.find("title")
                     title = (ttag.text.strip() if ttag else "")[:200]
 
-                    # Anchors (now include hash routes too)
+                    # Anchors (JS-rendered included)
                     links = [a.get("href") for a in soup.find_all("a", href=True)]
                     next_urls: List[str] = []
                     for href in links:
-                        if not href:
-                            continue
-                        # preserve fragment when href starts with '#' or when it contains a fragment route
-                        preserve = href.strip().startswith("#")
-                        nu = normalize_url(final_url, href, preserve_fragment=preserve)
+                        nu = normalize_url(final_url, href)
                         if not nu:
                             continue
                         if is_within_scope_host(nu, self.scope, self.allow_subdomains, start_url=self.start_url):
@@ -187,7 +242,7 @@ class BrowserCrawler:
                             out_ext += 1
                         next_urls.append(nu)
 
-                    # Basic forms/password detection
+                    # Forms/password detection
                     for form in soup.find_all("form"):
                         forms += 1
                         inputs = form.find_all("input")
@@ -215,7 +270,6 @@ class BrowserCrawler:
                                         await loc.nth(i).scroll_into_view_if_needed(timeout=1000)
                                     except Exception:
                                         pass
-                                    # Try click; allow brief settle (client routing)
                                     try:
                                         await loc.nth(i).click(timeout=2000)
                                         await page.wait_for_timeout(400)
@@ -223,8 +277,7 @@ class BrowserCrawler:
                                         continue
                                     after_url = page.url
                                     if after_url != before_url:
-                                        # Preserve fragments for SPA hash routes
-                                        nu = normalize_url(after_url, after_url, preserve_fragment=True)
+                                        nu = normalize_url(after_url, after_url)
                                         if nu and is_within_scope_host(nu, self.scope, self.allow_subdomains, start_url=self.start_url):
                                             if nu not in self.visited and should_enqueue(
                                                 nu, self.start_url, self.scope, self.allow_subdomains, self.exclude_prefixes
@@ -243,13 +296,12 @@ class BrowserCrawler:
                                 nu, self.start_url, self.scope, self.allow_subdomains, self.exclude_prefixes
                             ):
                                 queue.append((nu, depth + 1))
-
                 except Exception:
+                    # Keep crawling even if parsing fails
                     pass
 
             # Passive header audit
             try:
-                # Lowercase mapping for presence flags
                 lc = {k.lower(): v for k, v in (headers or {}).items()}
                 page_score, sec_issues, _summary = analyze_headers(
                     url=final_url,
