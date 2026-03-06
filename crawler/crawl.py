@@ -47,6 +47,19 @@ class Crawler:
         self.exclude_prefixes = exclude_prefixes or []
         self.auth = auth or AuthConfig()
 
+        # Crawl stats for debugging big sites
+        self.stats = {
+            "seeds": 0,
+            "enqueued": 0,
+            "visited": 0,
+            "fetched": 0,
+            "robots_disallowed": 0,
+            "out_of_scope": 0,
+            "excluded": 0,
+            "errors": 0,
+            "waves": 0,
+        }
+
         self.scope = set()
         self.scope_token = None
         self._init_scope()
@@ -72,7 +85,7 @@ class Crawler:
         headers = apply_cookie_header(headers, self.auth.cookie_string)
 
         session_kwargs = build_session_kwargs(self.auth)
-        # Keep per-request deadlines reasonable; total=None means "no global session timeout"
+        # No global total timeout; keep tight connect/read timeouts
         timeout = aiohttp.ClientTimeout(total=None, sock_connect=15, sock_read=30)
         connector = aiohttp.TCPConnector(ssl=False, limit=0)  # semaphore gates concurrency
 
@@ -84,20 +97,19 @@ class Crawler:
             raise_for_status=False,
             **session_kwargs
         ) as session:
-            # Optional authorized login (no bypassing)
+            # Optional authorized login (do not abort crawl on error)
             try:
                 await perform_form_login(session, self.auth)
             except Exception:
-                # login failures should not kill the crawl
                 pass
 
-            # Robots & sitemap discovery should never abort crawl
+            # Robots & sitemap
             try:
                 rp, sitemaps = await load_robots(session, self.start_url, self.user_agent)
             except Exception:
                 rp, sitemaps = (None, [])
 
-            # Seed set: start_url + sitemap URLs (limited)
+            # Seeds
             seeds = set([self.start_url])
             for sm in sitemaps[:5]:
                 try:
@@ -108,37 +120,51 @@ class Crawler:
                             if nu:
                                 seeds.add(nu)
                 except Exception:
-                    continue
+                    self.stats["errors"] += 1
 
             # Initialize queue
             queue: Deque[tuple[str, int]] = deque()
             for s in seeds:
+                # Always allow exact seed host, and then apply standard checks
                 if should_enqueue(s, self.start_url, self.scope, self.allow_subdomains, self.exclude_prefixes):
                     queue.append((s, 0))
+                    self.stats["enqueued"] += 1
+                else:
+                    # Count reasons
+                    if any(p and s.startswith(p) for p in self.exclude_prefixes):
+                        self.stats["excluded"] += 1
+                    elif not is_within_scope_host(s, self.scope, self.allow_subdomains, start_url=self.start_url):
+                        self.stats["out_of_scope"] += 1
+            self.stats["seeds"] = len(seeds)
 
-            # --- Wave scheduler: process queue -> wait tasks -> re-check queue ---
+            # Wave scheduler
             while len(self.visited) < self.max_pages:
                 scheduled_any = False
+                self.stats["waves"] += 1
 
-                # Schedule all currently available URLs (a "wave")
                 while queue and len(self.visited) < self.max_pages:
                     url, depth = queue.popleft()
                     if url in self.visited:
                         continue
                     self.visited.add(url)
+                    self.stats["visited"] += 1
 
-                    # robots guard
-                    if not can_fetch(rp if 'rp' in locals() else None, self.user_agent, url, self.respect_robots):
-                        continue
+                    # robots check
+                    try:
+                        if not can_fetch(rp if 'rp' in locals() else None, self.user_agent, url, self.respect_robots):
+                            self.stats["robots_disallowed"] += 1
+                            continue
+                    except Exception:
+                        pass
 
                     await self.sem.acquire()
                     asyncio.create_task(self._fetch_and_process(session, url, depth, queue))
                     scheduled_any = True
 
-                # Wait for this wave to finish
+                # Wait for all scheduled tasks
                 await self._drain()
 
-                # Stop if nothing new was scheduled, or no more URLs queued, or we hit cap
+                # Exit if nothing else to schedule
                 if not scheduled_any or not queue or len(self.visited) >= self.max_pages:
                     break
 
@@ -154,8 +180,7 @@ class Crawler:
         """
         flat: dict = {}
         try:
-            # hdrs is CIMultiDictProxy
-            for k in hdrs.keys():
+            for k in hdrs.keys():  # CIMultiDictProxy
                 vals = hdrs.getall(k)
                 flat[k] = "\n".join(vals)
         except Exception:
@@ -167,6 +192,8 @@ class Crawler:
         try:
             await asyncio.sleep(random.uniform(*self.rate_delay_range))
             async with session.get(url, allow_redirects=True) as resp:
+                self.stats["fetched"] += 1
+
                 final_url = str(resp.url)
                 status = resp.status
                 reason = resp.reason or ""
@@ -192,7 +219,6 @@ class Crawler:
                 if is_html:
                     try:
                         text = await resp.text(errors="ignore")
-                        # Use built-in parser to avoid lxml dependency on Streamlit Cloud
                         soup = BeautifulSoup(text, "html.parser")
 
                         ttag = soup.find("title")
@@ -205,7 +231,7 @@ class Crawler:
                             nu = normalize_url(final_url, href)
                             if not nu:
                                 continue
-                            if is_within_scope_host(nu, self.scope, self.allow_subdomains):
+                            if is_within_scope_host(nu, self.scope, self.allow_subdomains, start_url=self.start_url):
                                 out_int += 1
                             else:
                                 out_ext += 1
@@ -220,16 +246,21 @@ class Crawler:
                                 if URL(final_url).scheme == "http":
                                     pwd_over_http = True
 
-                        # enqueue next wave items
+                        # enqueue
                         if depth < self.max_depth:
                             for u in next_urls:
                                 if u not in self.visited and should_enqueue(
                                     u, self.start_url, self.scope, self.allow_subdomains, self.exclude_prefixes
                                 ):
                                     queue.append((u, depth + 1))
+                                    self.stats["enqueued"] += 1
+                                else:
+                                    if any(p and u.startswith(p) for p in self.exclude_prefixes):
+                                        self.stats["excluded"] += 1
+                                    elif not is_within_scope_host(u, self.scope, self.allow_subdomains, start_url=self.start_url):
+                                        self.stats["out_of_scope"] += 1
                     except Exception:
-                        # swallow parsing errors to keep crawl running
-                        pass
+                        self.stats["errors"] += 1
 
                 # --- Security audit on headers (passive) ---
                 try:
@@ -241,10 +272,9 @@ class Crawler:
                         scheme=scheme,
                         is_html=is_html,
                         has_password_form=has_pwd,
-                        page_title=title,  # for directory-listing indicator & heuristics
+                        page_title=title,
                     )
 
-                    # Store issues
                     for si in sec_issues:
                         self.issues.append(Issue(
                             url=si.url,
@@ -255,7 +285,6 @@ class Crawler:
                             recommendation=si.recommendation
                         ))
 
-                    # Store page finding
                     self.findings.append(PageFinding(
                         url=url,
                         final_url=final_url,
@@ -278,11 +307,9 @@ class Crawler:
                         security_score=page_score
                     ))
                 except Exception:
-                    # Header audit should never kill fetch
-                    pass
+                    self.stats["errors"] += 1
 
         except Exception:
-            # Keep crawling even if a single fetch fails
-            pass
+            self.stats["errors"] += 1
         finally:
             self.sem.release()
