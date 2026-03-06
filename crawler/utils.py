@@ -13,15 +13,20 @@ def normalize_url(base: str, href: str) -> str | None:
         joined = urljoin(base, href)
         clean, _ = urldefrag(joined)  # drop #fragment
         parts = urlparse(clean)
-        # reject non-http(s)
         if parts.scheme not in ("http", "https"):
             return None
         netloc = parts.hostname or ""
         if parts.port:
-            # Keep port only if non-default
             if (parts.scheme == "http" and parts.port != 80) or (parts.scheme == "https" and parts.port != 443):
                 netloc = f"{netloc}:{parts.port}"
-        normalized = urlunparse((parts.scheme, netloc.lower(), parts.path or "/", parts.params, parts.query, ""))
+        normalized = urlunparse((
+            parts.scheme,
+            netloc.lower(),
+            parts.path or "/",
+            parts.params,
+            parts.query,
+            "",
+        ))
         return normalized
     except Exception:
         return None
@@ -40,17 +45,11 @@ def is_allowed_host(url: str, allowed_hosts: set[str]) -> bool:
     return host in allowed_hosts
 
 def canonical_host_set(root: str, allow_subdomains: bool) -> set[str]:
-    """
-    Build allowed host set based on root URL and flag for subdomains.
-    """
     host = URL(root).host or ""
     if not allow_subdomains:
         return {host}
-    # include subdomains based on registrable domain
     ext = tldextract.extract(host)
     reg = f"{ext.domain}.{ext.suffix}" if ext.suffix else ext.domain
-    # we accept any host that ends with the registrable domain
-    # host check is done via suffix check in is_within_scope_host()
     return {reg}
 
 def is_within_scope_host(url: str, scope: set[str], allow_subdomains: bool) -> bool:
@@ -59,7 +58,6 @@ def is_within_scope_host(url: str, scope: set[str], allow_subdomains: bool) -> b
         return False
     if not allow_subdomains:
         return host in scope
-    # scope contains registrable domain token
     token = next(iter(scope))
     return host == token or host.endswith("." + token)
 
@@ -69,10 +67,8 @@ def should_enqueue(url: str, start_url: str, scope: set[str], allow_subdomains: 
     for p in exclude_prefixes:
         if url.startswith(p):
             return False
-    # Stay on same scheme family (http/https)
     s0 = URL(start_url).scheme
     s1 = URL(url).scheme
     if s0 in ("http", "https") and s1 in ("http", "https"):
         return True
     return False
-``
