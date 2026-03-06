@@ -5,6 +5,7 @@ from typing import Deque, List, Set, Tuple, Optional
 
 from bs4 import BeautifulSoup
 from yarl import URL
+import random
 
 from .utils import normalize_url, should_enqueue, is_within_scope_host
 from .security_audit import analyze_headers
@@ -12,7 +13,7 @@ from .report import PageFinding, Issue
 
 # Playwright is optional. We import lazily and guard failures.
 try:
-    from playwright.async_api import async_playwright, Page, Browser, BrowserContext
+    from playwright.async_api import async_playwright, Page, BrowserContext
     _PLAYWRIGHT_AVAILABLE = True
 except Exception:
     _PLAYWRIGHT_AVAILABLE = False
@@ -26,7 +27,7 @@ class BrowserCrawler:
 
     - Executes JS (SPA-friendly)
     - Parses rendered DOM for anchors
-    - Optional "safe clicks" on same-origin buttons/links to discover client-routed pages
+    - Optional "safe clicks" on same-origin buttons/links (client-side routes)
     - Passive header audit only (no payloads)
     """
     def __init__(
@@ -81,7 +82,6 @@ class BrowserCrawler:
 
     async def run(self):
         if not _PLAYWRIGHT_AVAILABLE:
-            # Nothing to do; caller should catch and fallback.
             return
 
         sem = asyncio.Semaphore(self.concurrency)
@@ -96,11 +96,8 @@ class BrowserCrawler:
             )
             # Basic Auth if provided
             if self.basic_user and self.basic_pass:
-                context_args["http_credentials"] = {
-                    "username": self.basic_user,
-                    "password": self.basic_pass,
-                }
-            # Cookie header as extra header (simple & works across requests)
+                context_args["http_credentials"] = {"username": self.basic_user, "password": self.basic_pass}
+            # Cookie header as extra header
             extra_headers = {}
             if self.cookie_string:
                 extra_headers["Cookie"] = self.cookie_string
@@ -110,22 +107,19 @@ class BrowserCrawler:
             context: BrowserContext = await browser.new_context(**context_args)
 
             queue: Deque[Tuple[str, int]] = deque()
-            # Always enqueue the seed (we treat seed host as in-scope in should_enqueue)
+            # Always enqueue the seed
             if should_enqueue(self.start_url, self.start_url, self.scope, self.allow_subdomains, self.exclude_prefixes):
                 queue.append((self.start_url, 0))
 
-            # Wave scheduler (mirrors HTTP mode)
+            # Wave scheduler
             while queue and len(self.visited) < self.max_pages:
                 tasks = []
-                # schedule up to concurrency items
                 for _ in range(min(self.concurrency, len(queue))):
                     url, depth = queue.popleft()
                     if url in self.visited:
                         continue
                     self.visited.add(url)
-                    tasks.append(asyncio.create_task(
-                        self._visit_one(context, url, depth, queue, sem)
-                    ))
+                    tasks.append(asyncio.create_task(self._visit_one(context, url, depth, queue, sem)))
 
                 if not tasks:
                     break
@@ -136,11 +130,14 @@ class BrowserCrawler:
 
     async def _visit_one(self, context: BrowserContext, url: str, depth: int, queue: Deque[Tuple[str, int]], sem: asyncio.Semaphore):
         async with sem:
-            # A new page per URL keeps isolation and simpler handlers
+            # politeness
+            await asyncio.sleep(random.uniform(*self.rate_delay_range))
+
             page: Page = await context.new_page()
-            # Go to url; wait for network to be mostly idle to allow SPA bootstrap
+            # Navigate; allow SPA bootstrap
             resp = await page.goto(url, wait_until="networkidle", timeout=30000)
-            # Extract response details
+
+            # Response details
             headers = {}
             status = 0
             reason = ""
@@ -159,26 +156,29 @@ class BrowserCrawler:
             is_html = isinstance(ctype, str) and ("text/html" in ctype.lower()) and status < 400
 
             title = ""
-            text = ""
             out_int = 0
             out_ext = 0
             forms = 0
             has_pwd = False
             pwd_over_http = (URL(final_url).scheme == "http")
 
-            # Parse the *rendered* DOM
+            # Rendered DOM parse
             if is_html:
                 try:
-                    text = await page.content()
-                    soup = BeautifulSoup(text, "html.parser")
+                    html = await page.content()
+                    soup = BeautifulSoup(html, "html.parser")
                     ttag = soup.find("title")
                     title = (ttag.text.strip() if ttag else "")[:200]
 
-                    # anchors (rendered by JS included)
+                    # Anchors (now include hash routes too)
                     links = [a.get("href") for a in soup.find_all("a", href=True)]
-                    next_urls = []
+                    next_urls: List[str] = []
                     for href in links:
-                        nu = normalize_url(final_url, href)
+                        if not href:
+                            continue
+                        # preserve fragment when href starts with '#' or when it contains a fragment route
+                        preserve = href.strip().startswith("#")
+                        nu = normalize_url(final_url, href, preserve_fragment=preserve)
                         if not nu:
                             continue
                         if is_within_scope_host(nu, self.scope, self.allow_subdomains, start_url=self.start_url):
@@ -187,21 +187,20 @@ class BrowserCrawler:
                             out_ext += 1
                         next_urls.append(nu)
 
-                    # basic forms/password detection
+                    # Basic forms/password detection
                     for form in soup.find_all("form"):
                         forms += 1
                         inputs = form.find_all("input")
                         if any((i.get("type") or "").lower() == "password" for i in inputs):
                             has_pwd = True
 
-                    # Optional exploratory clicks (safe, same-origin)
+                    # Optional exploratory clicks (same-origin only)
                     if self.enable_safe_clicks and self.max_clicks_per_page > 0 and depth < self.max_depth:
-                        # choose a small list of interactive candidates; prioritise obvious nav
                         selectors = [
                             "a[role='button']",
                             "button",
                             "[role='button']",
-                            "a[href]"  # fallback (will click only if same-origin and URL actually changes)
+                            "a[href]"
                         ]
                         clicked = 0
                         for sel in selectors:
@@ -212,18 +211,22 @@ class BrowserCrawler:
                                 n = await loc.count()
                                 for i in range(min(n, self.max_clicks_per_page - clicked)):
                                     before_url = page.url
-                                    # Try a safe click
+                                    try:
+                                        await loc.nth(i).scroll_into_view_if_needed(timeout=1000)
+                                    except Exception:
+                                        pass
+                                    # Try click; allow brief settle (client routing)
                                     try:
                                         await loc.nth(i).click(timeout=2000)
-                                        await page.wait_for_timeout(350)  # brief settle
+                                        await page.wait_for_timeout(400)
                                     except Exception:
                                         continue
                                     after_url = page.url
-                                    # Accept only *same-origin* navigations that changed the URL
                                     if after_url != before_url:
-                                        if is_within_scope_host(after_url, self.scope, self.allow_subdomains, start_url=self.start_url):
-                                            nu = normalize_url(after_url, after_url)
-                                            if nu and nu not in self.visited and should_enqueue(
+                                        # Preserve fragments for SPA hash routes
+                                        nu = normalize_url(after_url, after_url, preserve_fragment=True)
+                                        if nu and is_within_scope_host(nu, self.scope, self.allow_subdomains, start_url=self.start_url):
+                                            if nu not in self.visited and should_enqueue(
                                                 nu, self.start_url, self.scope, self.allow_subdomains, self.exclude_prefixes
                                             ):
                                                 queue.append((nu, depth + 1))
@@ -233,18 +236,21 @@ class BrowserCrawler:
                             except Exception:
                                 continue
 
-                    # enqueue discovered anchors
+                    # Enqueue discovered anchors
                     if depth < self.max_depth:
                         for nu in next_urls:
                             if nu not in self.visited and should_enqueue(
                                 nu, self.start_url, self.scope, self.allow_subdomains, self.exclude_prefixes
                             ):
                                 queue.append((nu, depth + 1))
+
                 except Exception:
                     pass
 
             # Passive header audit
             try:
+                # Lowercase mapping for presence flags
+                lc = {k.lower(): v for k, v in (headers or {}).items()}
                 page_score, sec_issues, _summary = analyze_headers(
                     url=final_url,
                     status=status,
@@ -277,17 +283,17 @@ class BrowserCrawler:
                     forms_count=forms,
                     has_password_form=has_pwd,
                     password_form_over_http=pwd_over_http,
-                    hdr_csp=("content-security-policy" in {k.lower(): v for k, v in headers.items()}),
-                    hdr_xfo=("x-frame-options" in {k.lower(): v for k, v in headers.items()}),
-                    hdr_hsts=("strict-transport-security" in {k.lower(): v for k, v in headers.items()}),
-                    hdr_xcto=("x-content-type-options" in {k.lower(): v for k, v in headers.items()}),
-                    hdr_refpol=("referrer-policy" in {k.lower(): v for k, v in headers.items()}),
+                    hdr_csp=("content-security-policy" in lc),
+                    hdr_xfo=("x-frame-options" in lc),
+                    hdr_hsts=("strict-transport-security" in lc),
+                    hdr_xcto=("x-content-type-options" in lc),
+                    hdr_refpol=("referrer-policy" in lc),
                     security_score=page_score
                 ))
             except Exception:
                 pass
 
-            # close page to free resources
+            # Close page
             try:
                 await page.close()
             except Exception:
