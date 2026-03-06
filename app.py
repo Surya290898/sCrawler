@@ -4,16 +4,20 @@ import pandas as pd
 
 from crawler.crawl import Crawler, DEFAULT_UA
 from crawler.auth import AuthConfig
-from crawler.report import to_dataframe, to_csv, to_json
+from crawler.report import (
+    to_dataframe, to_csv, to_json,
+    issues_to_dataframe, issues_to_csv, issues_to_json,
+    overall_site_score
+)
 
 st.set_page_config(page_title="Authorized Crawler", page_icon="🕷️", layout="wide")
 
 st.title("🕷️ Authorized Web Crawler")
-st.caption("For in-scope, authorized discovery only. No bypassing authentication or protections.")
+st.caption("For in-scope, authorized discovery only. Passive header analysis — no bypassing protections.")
 
 with st.sidebar:
     st.header("Scope & Limits")
-    start_url = st.text_input("Start URL", placeholder="https://example.com", help="Must be the root of your crawl scope.")
+    start_url = st.text_input("Start URL", placeholder="https://example.com")
     allow_subdomains = st.checkbox("Allow subdomains", True)
     max_depth = st.number_input("Max depth", min_value=0, max_value=10, value=3)
     max_pages = st.number_input("Max pages", min_value=1, max_value=5000, value=500)
@@ -23,7 +27,7 @@ with st.sidebar:
     rate_max = st.number_input("Rate delay max (sec)", min_value=0.0, max_value=5.0, value=0.5, step=0.1)
     ua = st.text_input("User-Agent", value=DEFAULT_UA)
 
-    st.header("Authentication (Optional — for authorized targets)")
+    st.header("Authentication (Optional — authorized targets)")
     auth_mode = st.selectbox("Auth Type", ["None", "Basic", "Cookie", "Login Form"])
 
     basic_user = basic_pass = None
@@ -64,9 +68,6 @@ if run_button:
         st.stop()
 
     st.info("Crawling… This may take a while depending on limits and target size.")
-    progress = st.empty()
-    findings_placeholder = st.empty()
-
     auth = AuthConfig(
         basic_user=basic_user,
         basic_pass=basic_pass,
@@ -92,48 +93,83 @@ if run_button:
         auth=auth,
     )
 
-    # Run crawler
     async def run_and_collect():
         await crawler.run()
-        return crawler.findings
+        return crawler.findings, crawler.issues
 
-    findings = asyncio.run(run_and_collect())
+    findings, issues = asyncio.run(run_and_collect())
 
     if not findings:
         st.warning("No pages crawled. Check scope/limits/auth or try again.")
         st.stop()
 
-    df = to_dataframe(findings)
-    st.success(f"Crawl finished. Pages visited: {len(df)}")
+    df_pages = to_dataframe(findings)
+    df_issues = issues_to_dataframe(issues)
 
-    # Summary
+    # --- KPI Summary ---
+    site_score = overall_site_score(findings)
+    st.success(f"Crawl finished. Pages visited: {len(df_pages)}  |  Overall Site Score: {site_score}/100")
+
     c1, c2, c3, c4 = st.columns(4)
     with c1:
-        st.metric("Pages", len(df))
+        st.metric("Avg Page Score", int(df_pages["security_score"].mean()))
     with c2:
-        st.metric("HTTP errors (>=400)", int((df['status'] >= 400).sum()))
+        st.metric("Pages missing CSP", int((~df_pages["hdr_csp"]).sum()))
     with c3:
-        st.metric("Pages missing CSP", int((~df['hdr_csp']).sum()))
+        st.metric("Password forms over HTTP", int(df_pages["password_form_over_http"].sum()))
     with c4:
-        st.metric("Password forms over HTTP", int(df['password_form_over_http'].sum()))
+        st.metric("HTTP errors (>=400)", int((df_pages['status'] >= 400).sum()))
 
-    # Table
-    with st.expander("View Findings Table", expanded=True):
-        view_cols = [
-            "url","final_url","status","title","content_type","num_outlinks_internal",
-            "num_outlinks_external","forms_count","has_password_form","password_form_over_http",
-            "hdr_csp","hdr_xfo","hdr_hsts","hdr_xcto","hdr_refpol"
+    # --- Severity Breakdown ---
+    st.subheader("Severity Breakdown")
+    if not df_issues.empty:
+        sev_counts = df_issues["severity"].value_counts().reindex(
+            ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"], fill_value=0
+        )
+        st.bar_chart(sev_counts)
+    else:
+        st.info("No issues detected by header audit.")
+
+    # --- Pages Table ---
+    with st.expander("📄 Pages (with security score)", expanded=True):
+        cols = [
+            "final_url","status","title","content_type",
+            "security_score",
+            "hdr_csp","hdr_xfo","hdr_hsts","hdr_xcto","hdr_refpol",
+            "has_password_form","password_form_over_http",
+            "num_outlinks_internal","num_outlinks_external"
         ]
-        st.dataframe(df[view_cols], use_container_width=True, hide_index=True)
+        view = df_pages[cols].sort_values(by="security_score")
+        st.dataframe(view, use_container_width=True, hide_index=True)
 
-    # Downloads
-    cdl1, cdl2 = st.columns(2)
+    # --- Issues Table ---
+    with st.expander("🛡️ Issues (OWASP-aligned)", expanded=True):
+        if not df_issues.empty:
+            sev_filter = st.multiselect(
+                "Filter by severity",
+                options=["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"],
+                default=["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"]
+            )
+            view_issues = df_issues[df_issues["severity"].isin(sev_filter)].copy()
+            st.dataframe(
+                view_issues[["severity","title","url","check_id","description","recommendation"]],
+                use_container_width=True, hide_index=True
+            )
+        else:
+            st.info("No issues flagged.")
+
+    # --- Downloads ---
+    st.subheader("Downloads")
+    cdl1, cdl2, cdl3, cdl4 = st.columns(4)
     with cdl1:
-        st.download_button("⬇️ Download CSV", data=df.to_csv(index=False).encode("utf-8"), file_name="crawl_report.csv", mime="text/csv")
+        st.download_button("⬇️ Pages CSV", data=df_pages.to_csv(index=False).encode("utf-8"), file_name="pages.csv", mime="text/csv")
     with cdl2:
-        st.download_button("⬇️ Download JSON", data=df.to_json(orient="records", indent=2).encode("utf-8"), file_name="crawl_report.json", mime="application/json")
+        st.download_button("⬇️ Pages JSON", data=df_pages.to_json(orient="records", indent=2).encode("utf-8"), file_name="pages.json", mime="application/json")
+    with cdl3:
+        st.download_button("⬇️ Issues CSV", data=df_issues.to_csv(index=False).encode("utf-8"), file_name="issues.csv", mime="text/csv")
+    with cdl4:
+        st.download_button("⬇️ Issues JSON", data=df_issues.to_json(orient="records", indent=2).encode("utf-8"), file_name="issues.json", mime="application/json")
 
-    st.caption("Note: This tool is for authorized assessments within defined scope. Always obtain written permission.")
+    st.caption("Note: Passive header analysis for authorized assessments within defined scope.")
 else:
     st.info("Configure scope/auth in the sidebar and click **Start Crawl**.")
-``
