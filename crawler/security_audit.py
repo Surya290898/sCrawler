@@ -31,30 +31,13 @@ def _lc_headers(headers: Dict[str, str]) -> Dict[str, str]:
 
 def _getall_set_cookie(headers: Dict[str, str]) -> List[str]:
     """
-    We accept a flattened header mapping where multiple Set-Cookie values
-    are joined with newline separators. Split and return as a list.
+    Accept flattened headers where multiple Set-Cookie are joined with newline separators.
+    Split and return as a list.
     """
     raw = headers.get("set-cookie", "") or ""
     if not raw:
         return []
     return [line.strip() for line in raw.split("\n") if line.strip()]
-
-def _parse_directives(header_value: str) -> Dict[str, str]:
-    """
-    Parse semicolon-separated directives like in CSP or HSTS.
-    Returns a dict of directive -> value (value may be empty string).
-    """
-    out: Dict[str, str] = {}
-    for part in header_value.split(";"):
-        part = part.strip()
-        if not part:
-            continue
-        if " " in part:
-            k, v = part.split(" ", 1)
-            out[k.strip().lower()] = v.strip()
-        else:
-            out[part.strip().lower()] = ""
-    return out
 
 def _parse_hsts(value: str) -> Dict[str, str]:
     result: Dict[str, str] = {}
@@ -103,6 +86,17 @@ def _is_login_like_url(url: str) -> bool:
     tokens = ["login", "signin", "auth", "account", "session"]
     return any(t in path or t in qs for t in tokens)
 
+def _likely_directory_listing(page_title: str) -> bool:
+    t = (page_title or "").strip().lower()
+    if not t:
+        return False
+    # Common directory-index titles
+    candidates = [
+        "index of /", "directory listing for", "listing of /", "directory /",
+        "index of", "directory listing"
+    ]
+    return any(c in t for c in candidates)
+
 # ---------------------------
 # Checks & Scoring
 # ---------------------------
@@ -114,6 +108,7 @@ def analyze_headers(
     scheme: str,
     is_html: bool,
     has_password_form: bool,
+    page_title: str = "",  # NEW: used for directory-listing indicator
 ) -> Tuple[int, List[SecurityIssue], Dict[str, bool]]:
     """
     Returns (score, issues, summary_flags)
@@ -139,11 +134,17 @@ def analyze_headers(
         "has_nosniff": False,
         "has_refpol": False,
         "has_permspol": False,
+        "has_corp": False,
+        "has_coep": False,
+        "has_coop": False,
+        "has_expect_ct": False,
         "has_set_cookie": False,
         "cors_wildcard": False,
     }
 
-    # --- HSTS (HTTPS only) ---
+    # =========================
+    # Transport Security / HSTS
+    # =========================
     hsts = headers.get("strict-transport-security")
     if scheme == "https":
         if not hsts:
@@ -180,20 +181,20 @@ def analyze_headers(
                     "Add 'includeSubDomains' to HSTS for comprehensive protection.",
                     penalty=2
                 )
-    # If redirecting to HTTP
-    if status in (301, 302, 303, 307, 308):
-        loc = headers.get("location", "")
-        if scheme == "https" and loc.lower().startswith("http://"):
-            add_issue(
-                "DOWNGRADE_REDIRECT",
-                "HTTPS to HTTP redirect",
-                _sev(1),  # HIGH
-                f"Redirect sends users from HTTPS to HTTP: {loc}",
-                "Avoid protocol downgrades; redirect to HTTPS equivalents only.",
-                penalty=15
-            )
+    else:
+        # HTTP page detected (not redirected). Treat as weaker enforcement signal.
+        add_issue(
+            "HTTP_UNENFORCED",
+            "Page served over HTTP (no HTTPS enforcement observed)",
+            _sev(2),  # MEDIUM
+            "Content was retrieved over HTTP; users may be downgraded. Consider redirecting to HTTPS.",
+            "Redirect HTTP to HTTPS site-wide and enable HSTS.",
+            penalty=6
+        )
 
-    # --- CSP ---
+    # ==========
+    # CSP family
+    # ==========
     csp = headers.get("content-security-policy")
     if not csp:
         add_issue(
@@ -226,8 +227,8 @@ def analyze_headers(
                 penalty=5
             )
 
-    # --- Clickjacking: XFO or CSP frame-ancestors ---
-    xfo = headers.get("x-frame-options")
+    # Clickjacking: XFO or CSP frame-ancestors
+    xfo = (headers.get("x-frame-options") or "")
     fa_present = ("frame-ancestors" in (csp.lower() if csp else ""))
     if not xfo and not fa_present:
         add_issue(
@@ -240,9 +241,20 @@ def analyze_headers(
         )
     else:
         summary["has_xfo"] = bool(xfo)
+        # Potential conflict (info): legacy XFO + restrictive frame-ancestors with mismatch
+        if xfo and fa_present and ("deny" in xfo.lower() or "sameorigin" in xfo.lower()):
+            # not strictly wrong; just surface as info
+            add_issue(
+                "HEADER_OVERLAP_FRAME",
+                "X-Frame-Options present alongside CSP frame-ancestors",
+                _sev(4),  # INFO
+                "Both X-Frame-Options and CSP frame-ancestors are set. Prefer frame-ancestors; XFO is legacy.",
+                "Consider removing XFO once CSP frame-ancestors is fully deployed.",
+                penalty=0
+            )
 
-    # --- MIME Sniffing ---
-    xcto = headers.get("x-content-type-options", "")
+    # MIME Sniffing
+    xcto = (headers.get("x-content-type-options") or "")
     if xcto.lower() != "nosniff":
         add_issue(
             "NOSNIFF_MISSING",
@@ -255,7 +267,7 @@ def analyze_headers(
     else:
         summary["has_nosniff"] = True
 
-    # --- Referrer-Policy ---
+    # Referrer-Policy
     refpol = (headers.get("referrer-policy") or "").lower()
     if not refpol:
         add_issue(
@@ -278,9 +290,10 @@ def analyze_headers(
                 penalty=2
             )
 
-    # --- Permissions-Policy ---
-    permspol = headers.get("permissions-policy") or headers.get("feature-policy")
-    if not permspol:
+    # Permissions-Policy / Feature-Policy (deprecated)
+    permspol = headers.get("permissions-policy")
+    featurepol = headers.get("feature-policy")
+    if not permspol and not featurepol:
         add_issue(
             "PERMSPOL_MISSING",
             "Permissions-Policy missing",
@@ -290,20 +303,122 @@ def analyze_headers(
             penalty=1
         )
     else:
-        summary["has_permspol"] = True
-        if "*" in permspol:
+        if permspol:
+            summary["has_permspol"] = True
+            if "*" in permspol:
+                add_issue(
+                    "PERMSPOL_WILDCARD",
+                    "Permissions-Policy uses wildcard (*)",
+                    _sev(3),
+                    "Wildcard may unintentionally allow features for all origins.",
+                    "Replace '*' with explicit allowlists or disable with '()'.",
+                    penalty=2
+                )
+        if featurepol:
             add_issue(
-                "PERMSPOL_WILDCARD",
-                "Permissions-Policy uses wildcard (*)",
-                _sev(3),
-                "Wildcard may unintentionally allow features for all origins.",
-                "Replace '*' with explicit allowlists or disable with '()'.",
+                "FEATUREPOL_DEPRECATED",
+                "Feature-Policy header is deprecated",
+                _sev(4),  # INFO
+                "Use 'Permissions-Policy' instead of 'Feature-Policy'.",
+                "Migrate to 'Permissions-Policy'.",
+                penalty=0
+            )
+
+    # Cross-Origin policies (CORP / COEP / COOP)
+    corp = headers.get("cross-origin-resource-policy")
+    coep = headers.get("cross-origin-embedder-policy")
+    coop = headers.get("cross-origin-opener-policy")
+    if corp:
+        summary["has_corp"] = True
+    else:
+        add_issue(
+            "CORP_MISSING",
+            "Cross-Origin-Resource-Policy missing",
+            _sev(3),  # LOW
+            "Without CORP, some cross-origin resource protections are relaxed.",
+            "Add 'Cross-Origin-Resource-Policy: same-origin' (or 'same-site' for broader use-cases).",
+            penalty=1
+        )
+    if coep:
+        summary["has_coep"] = True
+    else:
+        add_issue(
+            "COEP_MISSING",
+            "Cross-Origin-Embedder-Policy missing",
+            _sev(3),  # LOW
+            "COEP is required for powerful features like cross-origin isolation.",
+            "Add 'Cross-Origin-Embedder-Policy: require-corp'.",
+            penalty=1
+        )
+    if coop:
+        summary["has_coop"] = True
+    else:
+        add_issue(
+            "COOP_MISSING",
+            "Cross-Origin-Opener-Policy missing",
+            _sev(3),  # LOW
+            "COOP helps isolate browsing contexts to prevent cross-origin interference.",
+            "Add 'Cross-Origin-Opener-Policy: same-origin'.",
+            penalty=1
+        )
+
+    # Expect-CT (largely deprecated but requested)
+    expect_ct = headers.get("expect-ct")
+    if expect_ct:
+        summary["has_expect_ct"] = True
+    else:
+        add_issue(
+            "EXPECT_CT_MISSING",
+            "Expect-CT header missing (deprecated)",
+            _sev(4),  # INFO
+            "Expect-CT is deprecated and generally unnecessary; surfaced because it was requested.",
+            "No action typically required; rely on HSTS and certificate transparency elsewhere.",
+            penalty=0
+        )
+
+    # =========
+    # CORS eval
+    # =========
+    acao = (headers.get("access-control-allow-origin") or "").strip()
+    acac = (headers.get("access-control-allow-credentials") or "").strip().lower()
+    acam = (headers.get("access-control-allow-methods") or "").strip().lower()
+    if acao:
+        if acao == "*" and acac == "true":
+            add_issue(
+                "CORS_WILDCARD_CREDENTIALS",
+                "CORS allows any origin with credentials",
+                _sev(1),  # HIGH
+                "Allowing any origin with credentials enables cross-site data exfiltration.",
+                "When credentials are allowed, set ACAO to a specific origin, not '*'.",
+                penalty=12
+            )
+            summary["cors_wildcard"] = True
+        elif acao == "*":
+            add_issue(
+                "CORS_WILDCARD",
+                "CORS allows any origin (*)",
+                _sev(2),  # MEDIUM
+                "Wildcard ACAO can expose responses to any website.",
+                "Restrict ACAO to specific trusted origins.",
+                penalty=5
+            )
+        if any(m in acam for m in ["delete", "put", "patch"]):
+            add_issue(
+                "CORS_BROAD_METHODS",
+                "Broad CORS methods allowed",
+                _sev(3),  # LOW
+                f"Exposes methods in CORS preflight: {acam}",
+                "Restrict allowed methods to those strictly needed.",
                 penalty=2
             )
 
-    # --- Cookies ---
+    # ==================
+    # Cookies & Sessions
+    # ==================
     set_cookies = _getall_set_cookie(headers)
-    summary["has_set_cookie"] = bool(set_cookies)
+    has_set_cookie = bool(set_cookies)
+    summary["has_set_cookie"] = has_set_cookie
+
     for line in set_cookies:
         c = _parse_cookie_line(line)
         name = c.get("name", "<cookie>")
@@ -311,7 +426,6 @@ def analyze_headers(
         is_httponly = "httponly" in c
         samesite = (c.get("samesite") or "").lower()
 
-        # Cookie set over HTTP is risky
         if scheme == "http":
             add_issue(
                 "COOKIE_OVER_HTTP",
@@ -359,41 +473,16 @@ def analyze_headers(
                 penalty=10
             )
 
-    # --- CORS ---
-    acao = (headers.get("access-control-allow-origin") or "")
-    acac = (headers.get("access-control-allow-credentials") or "").lower()
-    if acao:
-        if acao.strip() == "*" and acac == "true":
-            add_issue(
-                "CORS_WILDCARD_CREDENTIALS",
-                "ACAO '*' with credentials",
-                _sev(1),  # HIGH
-                "Allowing any origin with credentials enables cross-site data exfiltration.",
-                "When credentials are allowed, set ACAO to a specific origin, not '*'.",
-                penalty=12
-            )
-            summary["cors_wildcard"] = True
-        # Broad methods check
-        acam = (headers.get("access-control-allow-methods") or "").lower()
-        if any(m in acam for m in ["delete", "put", "patch"]):
-            add_issue(
-                "CORS_BROAD_METHODS",
-                "Broad CORS methods allowed",
-                _sev(3),  # LOW
-                f"Exposes methods in CORS preflight: {acam}",
-                "Restrict allowed methods to those strictly needed.",
-                penalty=2
-            )
-
-    # --- Caching (sensitive contexts) ---
+    # ========================
+    # Caching / Privacy checks
+    # ========================
     cache_ctrl = (headers.get("cache-control") or "").lower()
-    # pragma = (headers.get("pragma") or "").lower()  # not needed for logic below
-    is_sensitive = has_password_form or _is_login_like_url(url)
+    pragma = (headers.get("pragma") or "").lower()
+    is_sensitive_page = has_password_form or _is_login_like_url(url)
 
-    if is_sensitive and is_html:
-        no_store = "no-store" in cache_ctrl
-        no_cache = "no-cache" in cache_ctrl
-        if not (no_store or no_cache):
+    # Sensitive pages should not be cached
+    if is_sensitive_page and is_html:
+        if not (("no-store" in cache_ctrl) or ("no-cache" in cache_ctrl)):
             add_issue(
                 "CACHE_SENSITIVE",
                 "Sensitive page may be cached",
@@ -403,7 +492,21 @@ def analyze_headers(
                 penalty=6
             )
 
-    # --- Server/Framework Disclosure ---
+    # Any HTML page that sets cookies should not be publicly cacheable
+    if is_html and has_set_cookie:
+        if "public" in cache_ctrl or not cache_ctrl:
+            add_issue(
+                "CACHE_COOKIE_PUBLIC",
+                "Page that sets cookies appears publicly cacheable",
+                _sev(2),  # MEDIUM
+                "Public caching of cookie-setting responses risks session leakage.",
+                "Use 'Cache-Control: private, no-store' for user-specific pages.",
+                penalty=6
+            )
+
+    # ====================================
+    # Server / Framework information leaks
+    # ====================================
     server = headers.get("server", "")
     x_powered = headers.get("x-powered-by", "")
     aspver = headers.get("x-aspnet-version", "")
@@ -417,19 +520,53 @@ def analyze_headers(
                 "Remove or generalize version-identifying headers to reduce targeted exploits.",
                 penalty=2
             )
+        elif value:
+            add_issue(
+                "TECH_STACK_DISCLOSED",
+                f"{hdr_name} discloses technology",
+                _sev(3),  # LOW
+                f"Header reveals stack details: {value}",
+                "Avoid disclosing technology stack via response headers.",
+                penalty=1
+            )
 
-    # --- Deprecated Headers ---
+    # ===========================
+    # Deprecated / Legacy headers
+    # ===========================
     x_xss = (headers.get("x-xss-protection") or "").strip()
     if x_xss:
         add_issue(
-            "XXSS_DEPRECATED",
-            "X-XSS-Protection header is deprecated",
+            "XXSS_DEPRECATED_PRESENT",
+            "X-XSS-Protection header present (deprecated)",
             _sev(4),  # INFO
             f"Found X-XSS-Protection: {x_xss}. Modern browsers ignore it; rely on CSP instead.",
             "Remove X-XSS-Protection and implement a robust CSP.",
             penalty=0
         )
+    else:
+        # The user explicitly asked to track "Missing X-XSS-Protection".
+        add_issue(
+            "XXSS_DEPRECATED_MISSING",
+            "X-XSS-Protection header missing (deprecated)",
+            _sev(4),  # INFO
+            "This header is deprecated and generally unnecessary today.",
+            "No action typically required; ensure strong CSP instead.",
+            penalty=0
+        )
 
-    # Clamp score and return
+    # =========================
+    # Light content indicators
+    # =========================
+    if _likely_directory_listing(page_title):
+        add_issue(
+            "DIR_LISTING_INDICATOR",
+            "Possible directory listing",
+            _sev(2),  # MEDIUM
+            f"Page title suggests directory listing: \"{page_title}\".",
+            "Disable directory indexes or restrict access.",
+            penalty=6
+        )
+
+    # Final clamp & return
     score = max(0, min(100, score))
     return score, issues, summary
