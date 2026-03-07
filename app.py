@@ -12,19 +12,21 @@ from crawler.report import (
     issues_to_dataframe, issues_to_csv, issues_to_json,
     overall_site_score,
 )
-# Try unique-findings helpers if present
+# Try unique-findings helpers if present in your repo
 try:
     from crawler.report import aggregate_unique_findings, unique_findings_to_csv, unique_findings_to_json
     HAVE_UNIQUE = True
 except Exception:
     HAVE_UNIQUE = False
 
-# Optional Playwright-based crawler (JS Mode)
+# === NEW: Browserless cloud crawler (no Docker/VM needed)
 try:
-    from crawler.browser_crawl import BrowserCrawler, _PLAYWRIGHT_AVAILABLE
+    from crawler.jscloud_crawl import JSCloudCrawler
+    HAVE_JSCLOUD = True
 except Exception:
-    BrowserCrawler = None
-    _PLAYWRIGHT_AVAILABLE = False
+    JSCloudCrawler = None
+    HAVE_JSCLOUD = False
+
 
 # -------------------------
 # Page config
@@ -63,6 +65,7 @@ def _read_targets_from_file(uploaded_file) -> list[str]:
     try:
         name = (uploaded_file.name or "").lower()
         if name.endswith(".xlsx") or name.endswith(".xls"):
+            # Requires openpyxl in requirements
             df = pd.read_excel(uploaded_file, engine="openpyxl")
         elif name.endswith(".csv"):
             df = pd.read_csv(uploaded_file)
@@ -73,6 +76,7 @@ def _read_targets_from_file(uploaded_file) -> list[str]:
         if df.empty:
             return []
 
+        # Select column by heuristic
         cand = [c for c in df.columns if str(c).strip().lower() in ("url", "urls", "target", "targets")]
         col = cand[0] if cand else df.columns[0]
         series = df[col].dropna()
@@ -89,6 +93,19 @@ def _read_targets_from_file(uploaded_file) -> list[str]:
         st.error(f"Could not read uploaded file: {e}")
         return []
 
+    # De-duplicate while preserving order
+    return list(dict.fromkeys(urls))
+
+def _read_targets_from_text(text_block: str) -> list[str]:
+    """NEW: plain-text bulk URL seeder (one URL per line)."""
+    urls: list[str] = []
+    for line in (text_block or "").splitlines():
+        u = line.strip()
+        if not u:
+            continue
+        p = urlparse(u)
+        if p.scheme in ("http", "https") and p.netloc:
+            urls.append(u)
     return list(dict.fromkeys(urls))
 
 def _build_severity_chart(df_issues: pd.DataFrame):
@@ -143,13 +160,21 @@ def _build_severity_chart(df_issues: pd.DataFrame):
 with st.sidebar:
     st.header("Scan Targets")
 
+    # Single URL (optional)
     start_url = st.text_input("Single URL (optional)", placeholder="https://example.com")
 
+    # Bulk URLs via file
     target_file = st.file_uploader(
         "Bulk URLs file (optional) — .xlsx or .csv",
         type=["xlsx", "xls", "csv"],
         accept_multiple_files=False,
         help="File should contain a column named 'url' (or the first column will be used)."
+    )
+
+    # === NEW: Bulk URL Seeder (paste list)
+    bulk_text = st.text_area(
+        "Additional URLs (optional) — paste one per line",
+        placeholder="https://site.example/route-a\nhttps://site.example/route-b"
     )
 
     st.header("Scope & Limits")
@@ -188,25 +213,38 @@ with st.sidebar:
                     k, v = line.split("=", 1)
                     extra[k.strip()] = v.strip()
 
-    st.header("JavaScript (Playwright) [beta]")
-    # Disable toggle if Playwright isn't importable; runtime may still block Chromium => we also auto-fallback below.
-    if _PLAYWRIGHT_AVAILABLE and BrowserCrawler is not None:
-        enable_js = st.checkbox(
-            "Enable JavaScript rendering (SPA/JS links)",
+    st.header("JavaScript (Browserless Cloud) — No Docker/VM")
+    if HAVE_JSCLOUD:
+        enable_js_cloud = st.checkbox(
+            "Enable JS Cloud via Browserless",
             value=False,
-            help="If Chromium isn't available on this host, the app falls back to the HTTP crawler automatically."
+            help="Runs a real browser on Browserless via REST. If empty token/endpoint, falls back to HTTP crawler."
         )
     else:
-        enable_js = st.checkbox(
-            "Enable JavaScript rendering (SPA/JS links)",
+        enable_js_cloud = st.checkbox(
+            "Enable JS Cloud via Browserless",
             value=False, disabled=True,
-            help="Playwright not importable in this environment. Use HTTP mode or deploy with a Playwright container."
+            help="Module missing. Add crawler/jscloud_crawl.py to enable this."
         )
-    clicks_per_page = st.slider(
-        "Click exploration per page (same-origin only)",
-        min_value=0, max_value=3, value=0,
-        help="Try a few safe button/link clicks to discover client-side routes (0 = disabled)."
+
+    # Browserless settings
+    bl_endpoint = st.text_input(
+        "Browserless endpoint",
+        value="https://production-sfo.browserless.io",
+        help="Default cloud endpoint."
     )
+    bl_token = st.text_input(
+        "Browserless API token",
+        type="password",
+        help="Get from Browserless dashboard."
+    )
+    click_sel_txt = st.text_input(
+        "Click selectors (comma separated)",
+        value="a[role='button'],button,[role='button']",
+        help="Used to discover SPA routes. Keep small; clicks are limited."
+    )
+    clicks_per_page = st.slider("Clicks per page (0-3)", min_value=0, max_value=3, value=0)
+    goto_wait_until = st.selectbox("waitUntil", ["load", "domcontentloaded", "networkidle"], index=2)
 
     st.markdown("---")
     exclude_prefixes = st.text_area(
@@ -237,6 +275,7 @@ if reset_button:
 # Run crawl (single or bulk)
 # -------------------------
 if run_button:
+    # Gather targets
     targets: list[str] = []
     if isinstance(start_url, str) and start_url.strip():
         su = start_url.strip()
@@ -250,10 +289,15 @@ if run_button:
         file_urls = _read_targets_from_file(target_file)
         targets.extend(file_urls)
 
+    # === NEW: Bulk URL seeder from text
+    text_urls = _read_targets_from_text(bulk_text)
+    targets.extend(text_urls)
+
+    # De-duplicate final list
     targets = list(dict.fromkeys([t.strip() for t in targets if t.strip()]))
 
     if not targets:
-        st.error("Provide at least one target: Single URL and/or a bulk file (.xlsx/.csv).")
+        st.error("Provide at least one target: Single URL, bulk file, and/or the pasted URL list.")
         st.stop()
 
     st.info(f"Starting crawl for {len(targets)} target(s). This may take a while depending on limits and site sizes.")
@@ -274,30 +318,45 @@ if run_button:
     all_pages: list[pd.DataFrame] = []
     all_issues: list[pd.DataFrame] = []
 
+    # Shared extra headers for cloud browser calls (UA, Cookie if provided)
+    cloud_headers = {}
+    if cookie_string:
+        cloud_headers["Cookie"] = cookie_string
+    if ua and ua.strip():
+        cloud_headers["User-Agent"] = ua.strip()
+
+    # Click selectors list
+    click_selectors = [s.strip() for s in (click_sel_txt or "").split(",") if s.strip()]
+
     for idx, target in enumerate(targets, start=1):
         # Decide mode for this target
-        use_js = bool(enable_js and _PLAYWRIGHT_AVAILABLE and (BrowserCrawler is not None))
+        use_js_cloud = bool(
+            enable_js_cloud and HAVE_JSCLOUD and bl_token.strip() and bl_endpoint.strip()
+        )
 
-        if use_js:
-            crawler = BrowserCrawler(
+        if use_js_cloud:
+            crawler = JSCloudCrawler(
                 start_url=target,
+                endpoint=bl_endpoint.strip(),
+                api_token=bl_token.strip(),
                 allow_subdomains=allow_subdomains,
                 max_depth=int(max_depth),
                 max_pages=int(max_pages),
-                concurrency=max(1, int(min(concurrency, 6))),  # JS is heavier; cap concurrency
+                concurrency=max(1, int(min(concurrency, 6))),  # cloud browser is heavier; keep reasonable
                 rate_delay_range=(float(rate_min), float(rate_max)) if rate_max >= rate_min else (float(rate_max), float(rate_min)),
                 user_agent=ua.strip() or DEFAULT_UA,
                 exclude_prefixes=[p.strip() for p in exclude_prefixes if p.strip()],
-                cookie_string=cookie_string,
-                basic_user=basic_user,
-                basic_pass=basic_pass,
-                enable_safe_clicks=(clicks_per_page > 0),
+                click_selectors=click_selectors,
                 max_clicks_per_page=int(clicks_per_page),
+                goto_wait_until=goto_wait_until,
+                extra_headers=cloud_headers,
+                http_auth=(basic_user, basic_pass) if (basic_user and basic_pass) else None,
             )
 
             async def run_and_collect():
                 await crawler.run()
                 return crawler.findings, crawler.issues
+
         else:
             crawler = Crawler(
                 start_url=target,
@@ -316,35 +375,31 @@ if run_button:
                 await crawler.run()
                 return crawler.findings, crawler.issues
 
-        # ---- Run the selected crawler with auto-fallback for JS mode ----
+        # Run
         try:
             findings, issues = asyncio.run(run_and_collect())
-        except Exception:
-            js_failed = True
-        else:
-            js_failed = bool(getattr(crawler, "last_error", None)) if use_js else False
-
-        if use_js and js_failed:
-            warn_msg = getattr(crawler, "last_error", "Playwright failed")
-            st.warning(f"JS mode unavailable in this runtime ({warn_msg}). Falling back to HTTP crawler for {target}.")
-            http_crawler = Crawler(
-                start_url=target,
-                allow_subdomains=allow_subdomains,
-                max_depth=int(max_depth),
-                max_pages=int(max_pages),
-                concurrency=int(concurrency),
-                respect_robots=bool(respect_robots),
-                rate_delay_range=(float(rate_min), float(rate_max)) if rate_max >= rate_min else (float(rate_max), float(rate_min)),
-                user_agent=ua.strip() or DEFAULT_UA,
-                exclude_prefixes=[p.strip() for p in exclude_prefixes if p.strip()],
-                auth=auth_cfg,
-            )
-
-            async def _http_run():
-                await http_crawler.run()
-                return http_crawler.findings, http_crawler.issues
-
-            findings, issues = asyncio.run(_http_run())
+        except Exception as e:
+            # In case cloud call fails unexpectedly, fall back to HTTP mode
+            if use_js_cloud:
+                st.warning(f"JS Cloud failed for {target}. Falling back to HTTP crawler.")
+                http_crawler = Crawler(
+                    start_url=target,
+                    allow_subdomains=allow_subdomains,
+                    max_depth=int(max_depth),
+                    max_pages=int(max_pages),
+                    concurrency=int(concurrency),
+                    respect_robots=bool(respect_robots),
+                    rate_delay_range=(float(rate_min), float(rate_max)) if rate_max >= rate_min else (float(rate_max), float(rate_min)),
+                    user_agent=ua.strip() or DEFAULT_UA,
+                    exclude_prefixes=[p.strip() for p in exclude_prefixes if p.strip()],
+                    auth=auth_cfg,
+                )
+                async def _http_run():
+                    await http_crawler.run()
+                    return http_crawler.findings, http_crawler.issues
+                findings, issues = asyncio.run(_http_run())
+            else:
+                raise
 
         # Convert to DataFrames
         df_pages = to_dataframe(findings) if findings else pd.DataFrame()
@@ -372,18 +427,17 @@ if run_button:
 - **Scope blocked**: Ensure **Allow subdomains** is correct. Start from the canonical (post-redirect) host.
 - **Depth/limits**: Increase **Max depth** (e.g., 3→5) and **Max pages** (e.g., 500→2000).
 - **Auth/redirects**: If the start URL redirects to login or a different host, use **Login Form**/**Cookie** auth, or start from a public in-scope page.
-- **SPA/JS navigation**: Enable **JavaScript (Playwright)** mode. On managed hosts, deploy a container with Chromium to use JS mode.
-- **Rate/timeouts**: For slow sites, increase **Rate delay** and retry.
+- **SPA/JS navigation**: Turn ON **JS Cloud (Browserless)** and supply **Endpoint + API token**.
 """)
         st.stop()
 
-    # Aggregate overall score (simple mean proxy)
+    # Aggregate overall score (simple mean proxy for display)
     try:
         site_score = int(df_pages_all["security_score"].mean()) if "security_score" in df_pages_all.columns and not df_pages_all.empty else 0
     except Exception:
         site_score = 0
 
-    # Unique (de-duplicated) findings (optional if helpers exist)
+    # Unique (de-duplicated) findings with safety guard
     df_unique = pd.DataFrame()
     if HAVE_UNIQUE:
         try:
@@ -408,8 +462,7 @@ if run_button:
         "ua": ua.strip() or DEFAULT_UA,
         "exclude_prefixes": [p.strip() for p in exclude_prefixes if p.strip()],
         "auth_mode": auth_mode,
-        "enable_js": bool(enable_js),
-        "clicks_per_page": int(clicks_per_page),
+        "enable_js_cloud": bool(enable_js_cloud),
     }
 
 # -------------------------
@@ -562,4 +615,4 @@ else:
         st.info(st.session_state.message)
         st.session_state.message = None
     else:
-        st.info("Add a Single URL and/or upload a Bulk URLs file, configure scope/auth, then click **Start Crawl**.")
+        st.info("Add a Single URL and/or upload a Bulk URLs file (or paste URLs), configure scope/auth, then click **Start Crawl**.")
