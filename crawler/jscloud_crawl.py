@@ -2,24 +2,16 @@
 """
 JS Cloud Crawler (Browserless.io REST)
 
-This crawler renders pages in a real headless browser hosted by Browserless,
-optionally clicks a few elements to trigger SPA routing, extracts anchors from
-the rendered DOM, and runs the same passive header audit as your HTTP crawler.
+- Uses /function to render + (optionally) click.
+- Falls back to /content and /unblock if content is tiny/blocked.
+- Enqueues finalUrl when it changes (SPA routing).
+- Preserves hash routes (#/...) as distinct pages.
+- Collects link candidates in the browser (a[href], [routerLink], [data-href], basic onclick patterns)
+  before and after clicks, returns them to Python, and enqueues in-scope URLs.
 
-Workflow per page:
-  1) POST /function (Browserless) with a small JS snippet:
-       - goto(url, waitUntil)
-       - (optional) click up to N selectors
-       - return { html, finalUrl, status, headers }
-  2) If the HTML is tiny or blocked => fallback to:
-       - POST /content  (returns fully rendered HTML as text/html)
-       - POST /unblock  (returns rendered HTML when basic protections exist)
-  3) Parse rendered HTML, enqueue discovered anchors within scope
-  4) Run analyze_headers (passive) and store findings/issues
-
-References:
-  - Browserless REST APIs overview (/function, /content, /unblock)  https://docs.browserless.io/rest-apis/intro
-  - /content returns fully-rendered HTML (post-JS)                    https://docs.browserless.io/rest-apis/content
+Docs:
+- REST endpoints (/function, /content, /unblock): https://docs.browserless.io/rest-apis/intro
+- /content returns fully-rendered HTML post-JS:   https://docs.browserless.io/rest-apis/content
 """
 
 import asyncio
@@ -35,48 +27,29 @@ from .utils import normalize_url, should_enqueue, is_within_scope_host
 from .security_audit import analyze_headers
 from .report import PageFinding, Issue
 
-
 DEFAULT_UA = "Crawler-For-Authorized-Assessment/1.0 (+https://example.com) JSCloudClient"
 
 
+def _resolve_url_preserve_fragment(base: str, href: str) -> Optional[str]:
+    """
+    Resolve href relative to base, but KEEP the fragment (hash routes).
+    Use when href starts with '#' OR contains a fragment that matters.
+    """
+    try:
+        b = URL(base)
+        # URL() automatically resolves relative paths
+        if href.startswith("#"):
+            # Just attach fragment to the current URL
+            return str(b.with_fragment(href[1:]))
+        u = URL(href, encoded=False)
+        if not u.scheme:
+            u = URL(base).join(URL(href))
+        return str(u)
+    except Exception:
+        return None
+
+
 class JSCloudCrawler:
-    """
-    JavaScript-capable crawler using Browserless REST API (no Docker/VM on your side).
-
-    Parameters
-    ----------
-    start_url : str
-        Seed URL to start crawling from.
-    endpoint : str
-        Browserless endpoint (e.g., 'https://production-sfo.browserless.io').
-    api_token : str
-        Browserless API token (dashboard → API Access).
-    allow_subdomains : bool
-        Whether to consider subdomains in-scope.
-    max_depth : int
-        Maximum crawl depth from each seed.
-    max_pages : int
-        Maximum total pages per seed.
-    concurrency : int
-        Parallel pages to process (cloud browser is heavier; 2–6 recommended).
-    rate_delay_range : (float, float)
-        Randomized polite delay between requests/clicks.
-    user_agent : str
-        Effective UA for both HTTP client and Browserless session (extra header).
-    exclude_prefixes : list[str]
-        URL prefixes to skip (e.g., logout/admin).
-    click_selectors : list[str]
-        CSS selectors for safe clicks to trigger SPA routing (e.g., ["a[href^='/']", "button"]).
-    max_clicks_per_page : int
-        Number of clicks per page (0–3 is typical).
-    goto_wait_until : str
-        One of {"load", "domcontentloaded", "networkidle"}; 'networkidle' useful for SPAs.
-    extra_headers : dict
-        Extra headers sent via setExtraHTTPHeaders in the browser (e.g., Cookie/User-Agent).
-    http_auth : tuple[str, str] | None
-        Basic credentials (username, password) for HTTP auth if required.
-    """
-
     def __init__(
         self,
         start_url: str,
@@ -94,7 +67,7 @@ class JSCloudCrawler:
         goto_wait_until: str = "networkidle",
         extra_headers: Dict[str, str] | None = None,
         http_auth: tuple[str, str] | None = None,
-        min_html_len_for_ok: int = 4000,  # threshold to detect "empty/blocked" HTML
+        min_html_len_for_ok: int = 4000,
     ):
         self.start_url = start_url
         self.endpoint = endpoint.rstrip("/")
@@ -108,7 +81,7 @@ class JSCloudCrawler:
         self.exclude_prefixes = exclude_prefixes or []
         self.click_selectors = (
             [s.strip() for s in (click_selectors or []) if s.strip()]
-            or ["a[href^='/']"]  # default that works well for SPAs with real anchors
+            or ["a[href^='/']"]
         )
         self.max_clicks_per_page = max(0, max_clicks_per_page)
         self.goto_wait_until = goto_wait_until
@@ -116,7 +89,6 @@ class JSCloudCrawler:
         self.http_auth = http_auth
         self.min_html_len_for_ok = min_html_len_for_ok
 
-        # ensure UA is in extra headers used by the cloud browser
         if self.user_agent and "User-Agent" not in self.extra_headers:
             self.extra_headers["User-Agent"] = self.user_agent
 
@@ -124,12 +96,10 @@ class JSCloudCrawler:
         self.issues: List[Issue] = []
         self.visited: Set[str] = set()
 
-        # scope token (registrable domain) for enqueue
         self.scope: Set[str] = set()
         self.scope_token: Optional[str] = None
         self._init_scope()
 
-        # if JS cloud fails, set this and let caller fallback to HTTP-mode
         self.last_error: Optional[str] = None
 
     def _init_scope(self):
@@ -144,8 +114,7 @@ class JSCloudCrawler:
             self.scope_token = token
 
     async def run(self):
-        """Wave-scheduled crawl using Browserless REST calls."""
-        self.last_error = None  # reset
+        self.last_error = None
 
         sem = asyncio.Semaphore(self.concurrency)
         timeout = aiohttp.ClientTimeout(total=None, sock_connect=20, sock_read=60)
@@ -177,8 +146,7 @@ class JSCloudCrawler:
                 try:
                     await asyncio.gather(*tasks)
                 except Exception:
-                    # per-wave safety; any page-level errors should not halt the crawl
-                    pass
+                    pass  # per-wave safety
 
     async def _visit_one(
         self,
@@ -192,7 +160,7 @@ class JSCloudCrawler:
         async with sem:
             await asyncio.sleep(random.uniform(*self.rate_delay_range))
 
-            # 1) Try /function first: navigate + optional clicks + return html+headers
+            # 1) /function: navigate + (optional) clicks + collect links + return html+headers
             payload = self._build_function_payload(url)
             try:
                 async with session.post(func_url, json=payload) as resp:
@@ -210,10 +178,9 @@ class JSCloudCrawler:
             status: int = int(data.get("status") or 0)
             hdrs: Dict[str, str] = data.get("headers") or {}
             ctype = hdrs.get("content-type", "") or hdrs.get("Content-Type", "")
-            scheme = URL(final_url).scheme
+            link_candidates: List[str] = list(data.get("links") or [])  # NEW
 
-            # 2) Fallbacks if content seems empty/blocked:
-            #    Try /content first, then /unblock (as needed).
+            # 2) Fallbacks if content seems empty/blocked
             if len(html) < self.min_html_len_for_ok or status == 0 or status >= 400:
                 better = await self._fetch_content_fallback(session, final_url)
                 if len((better.get("html") or "")) > len(html):
@@ -232,33 +199,32 @@ class JSCloudCrawler:
                     hdrs = ub["headers"]
                     ctype = hdrs.get("content-type", "") or hdrs.get("Content-Type", "")
 
-            # Parse rendered content
+            # 3) If clicking changed the location (finalUrl != url), consider enqueuing it
+            if final_url and final_url != url and depth < self.max_depth:
+                if is_within_scope_host(final_url, self.scope, self.allow_subdomains, start_url=self.start_url):
+                    if final_url not in self.visited and should_enqueue(
+                        final_url, self.start_url, self.scope, self.allow_subdomains, self.exclude_prefixes
+                    ):
+                        queue.append((final_url, depth + 1))
+
+            # 4) Parse rendered HTML and merge with link_candidates
             title = ""
             out_int = 0
             out_ext = 0
             forms = 0
             has_pwd = False
             pwd_over_http = (URL(final_url).scheme == "http")
-
             is_html = isinstance(ctype, str) and ("text/html" in ctype.lower()) and status < 400
+
             if html and status < 400:
                 try:
                     soup = BeautifulSoup(html, "html.parser")
                     ttag = soup.find("title")
                     title = (ttag.text.strip() if ttag else "")[:200]
 
-                    # anchor discovery (post-JS render)
-                    links = [a.get("href") for a in soup.find_all("a", href=True)]
-                    next_urls: List[str] = []
-                    for href in links:
-                        nu = normalize_url(final_url, href)
-                        if not nu:
-                            continue
-                        if is_within_scope_host(nu, self.scope, self.allow_subdomains, start_url=self.start_url):
-                            out_int += 1
-                        else:
-                            out_ext += 1
-                        next_urls.append(nu)
+                    # anchors in rendered HTML
+                    anchors = [a.get("href") for a in soup.find_all("a", href=True)]
+                    link_candidates.extend([h for h in anchors if h])
 
                     # forms/password detection
                     for form in soup.find_all("form"):
@@ -267,24 +233,47 @@ class JSCloudCrawler:
                         if any((i.get("type") or "").lower() == "password" for i in inputs):
                             has_pwd = True
 
-                    # enqueue discovered anchors
-                    if depth < self.max_depth:
-                        for nu in next_urls:
-                            if nu not in self.visited and should_enqueue(
-                                nu, self.start_url, self.scope, self.allow_subdomains, self.exclude_prefixes
-                            ):
-                                queue.append((nu, depth + 1))
                 except Exception:
-                    # ignore parse issues
                     pass
 
-            # 3) Passive header audit
+            # 5) Normalize & enqueue link candidates (preserve hash routes)
+            #    We'll resolve against final_url (post-click location) for best accuracy.
+            uniq_links: List[str] = []
+            seen = set()
+            for href in link_candidates:
+                try:
+                    href = href.strip()
+                except Exception:
+                    continue
+                if not href:
+                    continue
+                # preserve fragments when present
+                if "#" in href or href.startswith("#"):
+                    nu = _resolve_url_preserve_fragment(final_url or url, href)
+                else:
+                    nu = normalize_url(final_url or url, href)
+                if not nu or nu in seen:
+                    continue
+                seen.add(nu)
+                uniq_links.append(nu)
+
+            for nu in uniq_links:
+                if depth < self.max_depth and nu not in self.visited:
+                    if should_enqueue(nu, self.start_url, self.scope, self.allow_subdomains, self.exclude_prefixes):
+                        queue.append((nu, depth + 1))
+                        # internal/external counts
+                        if is_within_scope_host(nu, self.scope, self.allow_subdomains, start_url=self.start_url):
+                            out_int += 1
+                        else:
+                            out_ext += 1
+
+            # 6) Passive header audit
             try:
                 page_score, sec_issues, _summary = analyze_headers(
-                    url=final_url,
+                    url=final_url or url,
                     status=status,
                     headers_in=hdrs,
-                    scheme=scheme,
+                    scheme=(URL(final_url or url).scheme),
                     is_html=is_html,
                     has_password_form=has_pwd,
                     page_title=title,
@@ -301,13 +290,13 @@ class JSCloudCrawler:
 
                 self.findings.append(PageFinding(
                     url=url,
-                    final_url=final_url,
+                    final_url=final_url or url,
                     status=status,
                     reason="",
                     title=title,
                     content_type=ctype,
                     content_length=len(html or ""),
-                    scheme=scheme,
+                    scheme=(URL(final_url or url).scheme),
                     num_outlinks_internal=out_int,
                     num_outlinks_external=out_ext,
                     forms_count=forms,
@@ -321,7 +310,7 @@ class JSCloudCrawler:
                     security_score=page_score
                 ))
             except Exception:
-                # keep crawling even if one page fails to audit
+                # keep going on audit errors
                 pass
 
     # -----------------------------
@@ -333,7 +322,8 @@ class JSCloudCrawler:
           - navigates to URL (waitUntil configurable),
           - records last 'document' response for headers+status,
           - optionally clicks a handful of selectors,
-          - returns { html, finalUrl, status, headers }.
+          - COLLECTS link candidates before and after clicks,
+          - returns { html, finalUrl, status, headers, links }.
         """
         code = """
         async ({ page, context }) => {
@@ -341,6 +331,30 @@ class JSCloudCrawler:
           const maxClicks = Math.max(0, Number(context.maxClicks || 0));
           const selectors = Array.isArray(context.clickSelectors) ? context.clickSelectors : [];
           const gotoOpts = { waitUntil, timeout: 30000 };
+
+          const collectLinks = () => {
+            const out = new Set();
+            // 1) Anchors
+            document.querySelectorAll('a[href]').forEach(a => {
+              try { out.add(new URL(a.getAttribute('href'), location.href).href); } catch (e) {}
+            });
+            // 2) routerLink (Angular)
+            document.querySelectorAll('[routerLink]').forEach(el => {
+              const v = el.getAttribute('routerLink');
+              if (v) { try { out.add(new URL(v, location.href).href); } catch (e) {} }
+            });
+            // 3) data-href pattern
+            document.querySelectorAll('[data-href]').forEach(el => {
+              const v = el.getAttribute('data-href');
+              if (v) { try { out.add(new URL(v, location.href).href); } catch (e) {} }
+            });
+            // 4) naive onclick="location.href='...'"
+            document.querySelectorAll('[onclick]').forEach(el => {
+              const m = (el.getAttribute('onclick') || '').match(/location\\.(assign|href)\\s*=\\s*['"]([^'"]+)['"]/);
+              if (m && m[2]) { try { out.add(new URL(m[2], location.href).href); } catch (e) {} }
+            });
+            return Array.from(out);
+          };
 
           let mainResponse = null;
           page.on('response', (res) => {
@@ -352,7 +366,6 @@ class JSCloudCrawler:
             } catch (e) {}
           });
 
-          // Extra headers and HTTP auth (if supported in this environment)
           try { await page.setExtraHTTPHeaders(context.extraHeaders || {}); } catch (e) {}
           if (context.httpAuth && context.httpAuth.username) {
             try {
@@ -361,18 +374,20 @@ class JSCloudCrawler:
             } catch (e) {}
           }
 
-          // Navigate
           try { await page.goto(context.url, gotoOpts); } catch (e) {}
 
-          // Limited safe-click exploration for SPA routes (same session)
+          const beforeLinks = collectLinks();
+
+          // Limited safe-click exploration
           let clicked = 0;
           for (const sel of selectors) {
             if (clicked >= maxClicks) break;
             try {
-              const handles = await page.$$(sel);
-              for (let i = 0; i < handles.length && clicked < maxClicks; i++) {
+              const nodes = await page.$$(sel);
+              for (let i = 0; i < nodes.length && clicked < maxClicks; i++) {
                 try {
-                  await handles[i].click({ delay: 20 });
+                  await nodes[i].click({ delay: 20 });
+                  // Let client-side routing settle
                   if (page.waitForLoadState) {
                     await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(()=>{});
                   } else {
@@ -383,6 +398,8 @@ class JSCloudCrawler:
               }
             } catch (e) {}
           }
+
+          const afterLinks = collectLinks();
 
           const html = await page.content();
           const finalUrl = page.url();
@@ -395,7 +412,9 @@ class JSCloudCrawler:
             }
           } catch (e) {}
 
-          return { html, finalUrl, status, headers };
+          // Merge and return
+          const links = Array.from(new Set([...(beforeLinks || []), ...(afterLinks || [])]));
+          return { html, finalUrl, status, headers, links };
         }
         """.strip()
 
@@ -409,23 +428,14 @@ class JSCloudCrawler:
         if self.http_auth and len(self.http_auth) == 2:
             ctx["httpAuth"] = {"username": self.http_auth[0], "password": self.http_auth[1]}
 
-        return {
-            "code": code,
-            "context": ctx,
-        }
+        return { "code": code, "context": ctx }
 
     async def _fetch_content_fallback(self, session: aiohttp.ClientSession, url: str) -> dict:
-        """
-        Fallback to Browserless /content:
-          - returns fully rendered HTML (text/html) post-JS
-          - good when /function returned tiny/blocked content
-        """
         content_url = f"{self.endpoint}/content?token={self.api_token}"
         try:
             async with session.post(content_url, json={"url": url}) as resp:
                 html = await resp.text()
-                return {
-                    "html": html or "",
+                return                 "html": html or "",
                     "finalUrl": url,
                     "status": resp.status,
                     "headers": {"content-type": resp.headers.get("content-type", "")}
@@ -434,16 +444,10 @@ class JSCloudCrawler:
             return {"html": "", "finalUrl": url, "status": 0, "headers": {}}
 
     async def _fetch_unblock_fallback(self, session: aiohttp.ClientSession, url: str) -> dict:
-        """
-        Optional fallback to Browserless /unblock (stealth-ish rendering):
-          - useful for basic passive bot protections (e.g., cookie walls)
-          - we request 'content: true' to receive rendered HTML in JSON
-        """
         unblock_url = f"{self.endpoint}/unblock?token={self.api_token}"
         payload = {"url": url, "content": True}
         try:
             async with session.post(unblock_url, json=payload) as resp:
-                # /unblock returns JSON; may contain { html, cookies, screenshot, ... }
                 data = await resp.json(content_type=None)
                 html = data.get("html") or ""
                 return {
